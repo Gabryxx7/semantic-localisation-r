@@ -1,0 +1,2021 @@
+---
+title: "Functions Definitions"
+output: html_notebook
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+# Setup
+
+If already generated call this to source all the functions from the
+trace environment. It will automatically create the environment for you.
+*Make sure to attach it AT THE END as it is copied into memory and any
+new change won't be updated when re-attached)*
+
+```{r eval=FALSE}
+source("R/generated/FunctionsDefinitions.R")
+```
+
+If this is the first time, call these to generate the R files from
+markdown, which can then easily be run/sourced and imported/attached as
+an environment.
+
+```{r eval=FALSE}
+knitr::purl("Notebooks/Definitions/FunctionsDefinitions.Rmd", output="R/generated/FunctionsDefinitions.R")
+knitr::purl("Notebooks/Testing/UnitTests.Rmd", output="R/generated//UnitTests.R")
+knitr::purl("Notebooks/Utils/UtilityFunctions.Rmd", output="R/generated/UtilityFunctions.R")
+knitr::purl("Notebooks/Utils/CheckingFunctions.Rmd", output="R/generated/CheckingFunctions.R")
+knitr::purl("Notebooks/Utils/RandomTraceGeneration.Rmd", output="R/generated/RandomTraceGeneration.R")
+```
+
+```{r}
+USE.ENV <- FALSE # Use this when testing functions, to avoid detaching/reattaching the environment everytime a function gets updated
+```
+
+## Create environment to avoid filling up the global environment
+
+We are also attaching it as a new environment to search from so we don't
+need to use trace.env::
+
+```{r}
+# Remove previously attached traces environments
+clean.attached.envs <- function(env_to_remove){
+  removed <- 0
+  should.stop <- FALSE
+  while(!should.stop){
+    should.stop <- tryCatch({
+      detach(name=env_to_remove, character.only = TRUE)
+      removed <- removed + 1
+      FALSE
+    }, error=function(cond) {
+      # message(cond)
+      TRUE
+    })
+  }
+  cat("Detached ", removed, " '", env_to_remove, "' environments", sep="")
+}
+clean.attached.envs("trace.env")
+
+rm(trace.env) # Removing the previous environment (not attached yet)
+
+if(USE.ENV){
+  trace.env <- new.env(parent=globalenv())
+} else{
+  trace.env <- environment()
+}
+
+# You can also copy the current working environment to something else
+# trace.new.env <- rlang::env_clone(trace.nv, parent=baseenv())
+# attach(trace.new.env)
+```
+
+```{r}
+trace.env$setup <- function(){
+library(dplyr)
+library(data.table)
+library(rmdHelpers)
+library(utils)
+library(foreach) 
+library(doParallel)
+library(stringr)    # working with strings
+library(lubridate)  # working with dates 
+library(readr)
+library(dlm)
+library(parallel)
+library(Rcpp)
+library(ggplot2)
+library(ggtext)
+library(plotly)
+library(viridis)
+numCores <- (detectCores()-1)
+}
+trace.env$setup()
+```
+
+## Setting up an environment to avoid getting the global environment too crowded
+
+```{r}
+source(file.path(getwd(),"R/generated","UtilityFunctions.R"), local = trace.env)
+```
+
+```{r eval=TRUE}
+if(!exists("new.tripsDT")) new.tripsDT <- readRDS("data/new.tripsDT.trace.rds")
+if(!exists("randTrace100")) randTrace100 <- readRDS("data/randomTrace100.rds")
+if(!exists("randTrace1000")) randTrace1000 <- readRDS("data/randTrace1000.rds")
+if(!exists("customTrace1")) customTrace1 <- trace.env$read.trace.csv("data/customTrace1.csv", time.col="time")
+```
+
+# REMEMBER TO READ THE DATASET AND CONVER IT WITH `build_trace_dataset` TO USER VECTORS INSTEAD OF STRINGS FOR EACH CELL
+
+```{r eval=FALSE}
+asString <- FALSE
+
+beaconsData <- sep2019.traces15.regular$data
+timeSeries <- sep2019.traces15.regular$timeSeries[["startTime"]]
+roomNames <<- sort(devices[nroom > 0]$nroom)
+beaconsInDataset <- unlist(lapply(beaconsData, function(x) x$minor[1]))
+
+new.tripsDT <<- build_trace_dataset(timeSeries, roomNames)
+# Combines each individual beacon's dataset into one large dataset, the result is saved into `new.tripsDt`
+invisible(lapply(beaconsData, combine_datasets, new.tripsDT, beaconsList = beaconsInDataset, asString=asString)) # asString=FALSE to have each cell as a vector instead of a string
+
+## Clean the strings in case asString == TRUE
+if(asString){
+  for (j in colnames(new.tripsDT)[-1]) set(new.tripsDT, j = j, value = substring(new.tripsDT[[j]], 2))
+}
+
+# adding a new column called tsID but I want it to be in front, so I'm saving the previous columns order and then adding it in front when reordering
+prevColNames <- colnames(new.tripsDT)
+new.tripsDT[, tsID := .I]
+setcolorder(new.tripsDT, c("tsID", prevColNames))
+
+saveRDS(new.tripsDT, "new.tripsDT.trace.rds")
+```
+
+# Basic Concepts
+
+We are working with datasets that carry this info with them:
+
+-   **Who**: Agents (e.g. people, agents, agents)
+    -   VARIABLE: they can move in time and space
+-   **Where**: Spaces/Areas (e.g rooms)
+    -   FIXED: They can contain 0 or more agents, do not change in time
+-   **When**: Time slots (e.g pre-defined slots of 10s or 10m, time
+    ranges) At the moment, a configuration can represented as follows:
+
+$$
+(who, where)
+$$ It's important to keep in mind that new states can follow the initial
+one through chaining: $$
+(who, where) \rightsquigarrow (who^1, where^1)  \rightsquigarrow (who^2, where^2) 
+$$ So the initial state should be structured in a way that the
+information is carried forward and not lost (as much as possible)
+
+# General Trace Concepts
+
+Before we can start defining a program, we should think of the basic
+blocks that build it up. Here is what we need:
+
+1.  A program consists of a *time-series data-set* and a *list of
+    states* (and of course some extra options/parameters):
+    -   The program should carry with itself a copy of the data-set,
+        modified to make it usable throughout the process
+    -   There should be at least one state
+    -   If there is more than one then the first state will be the
+        *initial* state and the last one will be the *final* state
+    -   Any state defined in between the initial and the final state
+        will be considered as a *transitional* state
+    -   A *trace* is a subset of the original data-set that starts at
+        the initial state, ends at the final state and comprises of the
+        transitional states in between.
+    -   If the transitional states do not appear between initial and
+        final state, that is NOT considered a trace.
+    -   The program will return a list of *traces*
+2.  Each state is made of:
+    -   A list of agents
+    -   A list of rooms
+    -   (optional) A list of time slots or a time range
+3.  Each list of agents can have:
+    -   One or more sets: At least ONE of the agents in the set should
+        be in the cell
+    -   One or more groups: ALL the agents in the set should be in the
+        cell
+    -   One (and only one) range: The number of agents in the cell
+        should be in the range [min, max]
+4.  Each list of rooms can have:
+    -   One or more sets: The selected agents can be in any of these
+        rooms, but each room is treated individually. For instance:
+        Given a set `{a1, a2}` if they move from room `a1` to room `a2`
+        that's still a trace but a new one)
+    -   One or more groups: ALL the agents in the set should be in the
+        cell
+    -   One (and only one) range: The number of agents in the cell
+        should be in the range [min, max]
+5.  So at the base of everything we have:
+    -   Sets
+    -   Groups
+    -   One range
+
+# 0. S3 Class Setup
+
+Here defines strings and values that should be kept consistent across
+the whole program (to avoid problems later on...)
+
+```{r}
+trace.env$ELEMENT_TYPE <- list(generic="generic", agent="agent", agents="agent", room="room", rooms="agent", time="time", times="times")
+trace.env$CLASS_NAMES <- list(program="Trace",
+                              state="Trace.State",
+                              rooms="Trace.State.Rooms", rooms="Trace.State.Rooms",
+                              agents="Trace.State.Agents")
+trace.env$DEF_CLASSES <- list(set="Trace.State.Set", group="Trace.State.Group", range="Trace.State.Range", wildcard="Trace.Wildcard")
+trace.env$OP <- list(negation="!", exclusion="~", addition="+", subtraction="-", any=".any", all=".all", look.behind=".prev")
+
+trace.env$get_brackets <- function(class=DEF_CLASSES$set){
+  if(class == DEF_CLASSES$group) return(c("(", ")"))
+  if(class == DEF_CLASSES$range) return(c("[", "]"))
+  return(c("{", "}"))
+}
+
+trace.env$generic_warning <- function(op_char, type, cause="", problem="",action=""){
+  warning(paste0("Warning: ", op_char, " is ", cause, " for ", type, "s ", problem, ". ", action))
+}
+trace.env$unsupported_warning <- function(op_char, type, problem="", action=""){
+  generic_warning(op_char, type, "unsupported", problem, action)
+}
+trace.env$redundant_warning <- function(op_char, type, problem="", action=""){
+  generic_warning(op_char, type, "redundant", problem, action)
+}
+```
+
+# 5. Sets/Groups/Range Definition
+
+To define sets, group or ranges, it would be nice to simply call
+something like `range()`, `set()` or `group()` without having to specify
+what entities it is for. After reading a bit about quasiquotation and
+expressions capturing, I decided to give it a go to make the syntax
+easier to understand
+
+Sources: -
+<https://stackoverflow.com/questions/63431350/can-you-create-an-r-function-that-calls-using-a-prefix-and-suffix-operating-lik> -
+<https://www.rdocumentation.org/packages/rlang/versions/0.1/topics/quosure> -
+<https://adv-r.hadley.nz/quasiquotation.html#substitution> -
+<https://adv-r.hadley.nz/functions.html#prefix-transform>
+
+## Definition environment
+
+Since I want functions to have a different "meaning" depending on what
+we are defining I decided to create a "definition environment" with 3
+environments inside of it, one per entity typpe. This environment is
+only used to define generic sets, groups and ranges, since they will be
+*sort of* similar across entities.
+
+```{r}
+trace.env$def.env <- new.env(parent=trace.env)
+trace.env$def.env[["get"]] <- function(x){ return(eval(enexpr(x)))}
+trace.env$def.env$eval <- function(to_eval, envir=trace.env$def.env){
+  # cat("\nEvaluating ", typeof(to_eval),":",  paste0(to_eval))
+  if(typeof(to_eval) %in% c("symbol", "double", "integer", "numeric")){
+    char.sym <- as.character(to_eval)
+    if(char.sym %in% c(trace.env$OP$any, trace.env$OP$all, trace.env$OP$look.behind)){
+      # cat(" To eval: ", to_eval, "\n")
+      return(eval(to_eval, envir=envir))
+    }
+    if(startsWith(char.sym, ".")){
+      to_eval <- substring(char.sym, 2)
+      cat(" To eval: ", to_eval, "\n")
+      return(eval(sym(to_eval), envir=envir))
+    }
+    return(char.sym)
+  }
+  return(eval(to_eval, envir=envir))
+}
+
+trace.env$def.env$define <- function(..., entity_type=ELEMENT_TYPE$generic, def_class=DEF_CLASSES$set){
+  dots <- c(...)
+  if(is.null(dots) || length(dots) <= 0){
+    warning("Empty definition discarded")
+    return(NULL)
+  }
+  
+  ret <- dots
+  if(def_class == DEF_CLASSES$range){
+    ret <- as.numeric(head(sort(unlist(dots)), 2))
+  }
+  attr(ret, "class") <- def_class
+  attr(ret, "type") <- entity_type
+  
+  if("*" %in% unlist(ret)){
+    if(length(ret) > 1){
+       warning(paste0("Warning: Wildcard * includes all ", entity_type, " Other ", entity_type, "s in the ", def_class," definition have been discarded"))
+    }
+    ret.all <- list(c("*"))
+    attributes(ret.all) <- attributes(ret)
+    ret <- ret.all
+    ret <- trace.env$def.env$add_modifiers(ret, "include.all")
+  }
+  if("?" %in% unlist(ret)){
+    ret <- trace.env$def.env$add_modifiers(ret, "look.behind")
+  }
+  brackets <- get_brackets(def_class)
+  attr(ret, "string") <- paste0(brackets[1], paste0(ret, collapse=","), brackets[2])
+  return(ret)
+}
+
+trace.env$def.env[[trace.env$OP$any]] <- structure("*", class="Trace.Wildcard")
+trace.env$def.env[[trace.env$OP$all]] <- structure("*", class="Trace.Wildcard")
+trace.env$def.env[[trace.env$OP$look.behind]] <- structure("?", class="Trace.Wildcard")
+```
+
+Furthermore, every set or group can have modifiers such as: - Negation:
+The definition becomes a negative one - Exclusion: This definition will
+be transformed to select anything that is NOT part of it
+
+```{r}
+trace.env$def.env$add_modifiers <- function(def, ...){
+  modifiers <- c(...)
+  if(length(modifiers) <= 0) return(def)
+  prefix <- ""
+  if(any(c("exclude", "excluded") %in% modifiers)){
+    prefix <- paste0(prefix, trace.env$OP$exclusion)
+  }
+  if(any(c("not.in", "not") %in% modifiers)){
+    prefix <- paste0(prefix, trace.env$OP$negation)
+  }
+  attr(def, "string") <- paste0(prefix, attr(def, "string"))
+  attr(def, "modifiers") <- c(modifiers, attr(def, "modifiers"))
+  return(def)
+}
+
+trace.env$def.env[[trace.env$OP$negation]] <- function(x){ return(trace.env$def.env$add_modifiers(x, "not"))}
+trace.env$def.env[[trace.env$OP$exclusion]] <- function(x){ return(trace.env$def.env$add_modifiers(x, "exclude"))}
+```
+
+## Utility functions
+
+```{r}
+## Get a list of definitions (agents or sets) by filtering through a specific attribute
+trace.env$get_def_by_attr <- function(def_list, attr_name="class", attr_val=TRUE, fun=`==`){
+  return(Filter(function(x) fun(attr_val, attr(x, attr_name)), def_list))
+}
+
+trace.env$def_to_string <- function(def_data, prefix=""){
+  return(attr(def_data, "string"))
+}
+
+trace.env$defs_to_string <- function(defs, prefix=""){
+  sets_string <- paste0(lapply(defs, def_to_string, prefix), collapse="  ")
+}
+
+for(i in 1:length(trace.env$DEF_CLASSES)){
+  fun.name <- paste0("get_", names(trace.env$DEF_CLASSES)[[i]], "s")
+  fun.body <- paste0("trace.env$",fun.name," <- function(def_list){ return(get_def_by_attr(def_list, 'class', trace.env$DEF_CLASSES$", names(trace.env$DEF_CLASSES)[[i]], "))}")
+  cat("\nDefining: ", fun.body)
+  eval(parse(text=fun.body))
+  fun.name <- paste0("print.", trace.env$DEF_CLASSES[[i]])
+  eval(parse(text="trace.env[[fun.name]] <- function(def) { cat(attr(def, 'string')) }"))
+  eval(parse(text=".GlobalEnv[[fun.name]] <- trace.env[[fun.name]]"))
+}
+```
+
+## Merge Definitions
+
+```{r}
+trace.env$merge_definitions <- function(defs_list, type=ELEMENT_TYPE$generic){
+  merged <- list()
+  for(def in defs_list){
+    if(attr(def, "type") == type){
+      class <- paste0(attr(def, "class"), "s")
+      if(!(class %in% names(merged))){
+        merged[[class]] <- list()
+      }
+      else{
+        if(attr(def, "class") == DEF_CLASSES$range){
+          warning("More than one range has been defined. Only the first range [", paste0(merged[[class]], collapse=","), "] will be used")
+          next
+        }
+      }
+      merged[[class]] <- append(merged[[class]], list(def))
+    }
+  }
+  return(merged)
+}
+```
+
+# 4-3. Agents, Rooms (and Time) Definitions
+
+## Agents Definition/Selection
+
+Let's define a function to retrieve the agents given a string or an
+expression: We know that there are only three possible options for
+agents selections: - A set: $\{a1, a2, a3\}$, each agent is treated
+individually
+
+-   A group: $[a1, a2, a3]$, all agents are considered as one single
+    agent
+
+-   A size range $[min,max]$, any number of agents in the room
+
+-   A combination of those:
+
+    -   Set + group: $\langle\{a1, a2\} + (a3, a4)\rangle$
+    -   Set + size range: $\langle\{a1, a2\} + [2, 6]\rangle$
+    -   Group + size range: \\langle(a1, a2) + [2, 6]\\rangle\$
+
+```{r}
+agents.def.env <- new.env(parent=trace.env$def.env)
+
+agents.def.env$define <- function(..., def_class=DEF_CLASSES$set){
+  a.list <- enexprs(...)
+  a.list <- unlist(lapply(a.list, trace.env$def.env$eval, agents.def.env))
+  a.def <- trace.env$def.env$define(a.list, entity_type=ELEMENT_TYPE$agent, def_class=def_class)
+  return(a.def)
+}
+
+for(i in 1:length(trace.env$DEF_CLASSES)){
+  fun.name <- names(trace.env$DEF_CLASSES)[[i]]
+  class.name <- trace.env$DEF_CLASSES[[i]]
+  fun.body <- paste0("agents.def.env$",fun.name," <- function(...){ return(agents.def.env$define(..., def_class=trace.env$DEF_CLASSES$", fun.name, "))}")
+  cat("\nDEFINING: ", fun.body)
+  eval(parse(text=fun.body))
+}
+
+agents.def.env$a <- function(...){ 
+  agents <- enexprs(...)
+  agents <- lapply(agents, eval, envir=agents.def.env)
+  attr(agents, "class") <- CLASS_NAMES$agents
+  return(agents)
+}
+
+agents.def.env$agents <- agents.def.env$a
+```
+
+### Printing
+
+```{r}
+trace.env[[paste0("print.", trace.env$CLASS_NAMES$agents)]] <- function(state.agents){
+  defs <- unlist(lapply(state.agents, function(x) attr(x, "string")))
+  cat(paste0(defs, collapse=" "))
+}
+.GlobalEnv[[paste0("print.", trace.env$CLASS_NAMES$agents)]] <- trace.env[[paste0("print.", trace.env$CLASS_NAMES$agents)]]
+
+trace.env$agents_to_string <- function(agents, prefix=""){
+  return(paste0(lapply(agents, def_to_string, prefix), collapse="  "))
+}
+
+```
+
+Now that we have a simple way to add agents we can create a parser
+program just for that $who$ part in the state definition.
+
+## Rooms Definition/Selection
+
+Let's define a function to retrieve the rooms given a string or an
+expression: We know that there are only three possible options for rooms
+selections:
+
+-   A set: $\{r1, r2, r3\}$, each room is treated individually, agents
+    can start in any of them but moving between this room will end the
+    trace
+
+-   A group: $[r1, r2, r3]$, all rooms are considered as one compound
+    room, once an agent enters one of these rooms, as long as they keep
+    moving between any of these rooms, it will all be part of the trace
+
+```{r}
+rooms.def.env <- new.env(parent=trace.env$def.env)
+
+rooms.def.env$define <- function(..., def_class=DEF_CLASSES$set){
+  r.list <- enexprs(...)
+  r.list <- unlist(lapply(r.list, trace.env$def.env$eval, rooms.def.env))
+  r.def <- trace.env$def.env$define(r.list, entity_type=ELEMENT_TYPE$room, def_class=def_class)
+  return(r.def)
+}
+
+for(i in 1:length(trace.env$DEF_CLASSES)){
+  fun.name <- names(trace.env$DEF_CLASSES)[[i]]
+  class.name <- trace.env$DEF_CLASSES[[i]]
+  fun.body <- paste0("rooms.def.env$",fun.name," <- function(...){ return(rooms.def.env$define(..., def_class=trace.env$DEF_CLASSES$", fun.name, "))}")
+  cat("\nDEFINING: ", fun.body)
+  eval(parse(text=fun.body))
+}
+
+rooms.def.env$r <- function(...){ 
+  rooms <- enexprs(...)
+  rooms <- lapply(rooms, eval, envir=rooms.def.env)
+  attr(rooms, "class") <- CLASS_NAMES$rooms
+  return(rooms)
+}
+
+rooms.def.env$rooms <- rooms.def.env$r
+```
+
+### Printing
+
+```{r}
+trace.env[[paste0("print.", trace.env$CLASS_NAMES$rooms)]] <- function(state.rooms){
+  defs <- unlist(lapply(state.rooms, function(x) attr(x, "string")))
+  cat(paste0(defs, collapse=" "))
+}
+.GlobalEnv[[paste0("print.", trace.env$CLASS_NAMES$rooms)]] <- trace.env[[paste0("print.", trace.env$CLASS_NAMES$rooms)]]
+
+trace.env$rooms_to_string <- function(rooms, prefix=""){
+  return(paste0(lapply(rooms, def_to_string, prefix), collapse="  "))
+}
+
+```
+
+## Time Definition/Selection
+
+```{r}
+trace.env$tRange <- function(...){
+  return(trace.env$def.env$define(..., entity_type=ELEMENT_TYPE$time, def_class=DEF_CLASSES$range))
+}
+```
+
+# 2. State Definition
+
+Now that we have a way to add agents and rooms we can use them together
+to define an initial state
+
+```{r}
+trace.env$add_state <- function(program, aList=NULL, rList=NULL, tRange=NULL, follow=FALSE, name=NULL, fuzzy=TRUE){
+  aList <- eval(enexpr(aList), envir=agents.def.env)
+  rList <- eval(enexpr(rList), envir=rooms.def.env)
+  if(is.null(aList)){
+    stop("Error: You need to select at least one agent or a size range")
+  }
+  if(is.null(rList)){
+    stop("Error: You need to select at least one room")
+  }
+  
+  include.all.agents<- get_def_by_attr(aList, "modifiers", "include.all", `%in%`)
+  look.behind.agents <- get_def_by_attr(aList, "modifiers", "look.behind", `%in%`)
+  included.agents <- get_def_by_attr(aList, "modifiers", TRUE, function(x,y) length(y) <= 0)
+  excluded.agents <- get_def_by_attr(aList, "modifiers", "exclude", `%in%`)
+  negative.agents <- get_def_by_attr(aList, "modifiers", "not", `%in%`)
+  
+  include.all.rooms <- get_def_by_attr(rList, "modifiers", "include.all", `%in%`)
+  look.behind.rooms <- get_def_by_attr(rList, "modifiers", "look.behind", `%in%`)
+  included.rooms <- get_def_by_attr(rList, "modifiers", TRUE, function(x,y) length(y) <= 0)
+  excluded.rooms <- get_def_by_attr(rList, "modifiers", "exclude", `%in%`)
+  negative.rooms <- get_def_by_attr(rList, "modifiers", "not", `%in%`)
+  
+  positive.rooms <- c()
+  all.rooms <- attr(program, "room.cols")
+  if(length(include.all.rooms) > 0){
+    neg.all <- get_def_by_attr(rList, "modifiers", "not", `%in%`)
+    if(length(neg.all) > 0){
+      negative.rooms <- all.rooms
+    }
+    else{
+      positive.rooms <- all.rooms
+    }
+  }
+  else{
+    # cat("\nAll Rooms: ", paste0(all.rooms, collapse=","))
+    if(length(excluded.rooms) > 0){
+      # cat("\nExcluded Rooms: ", paste0(excluded.rooms, collapse=","))
+      positive.rooms <- all.rooms
+      positive.rooms <- positive.rooms[!(positive.rooms %in% unlist(excluded.rooms))]
+      # cat("\nExpanded excluded Rooms: ", paste0(positive.rooms, collapse=","))
+    }
+    if(length(included.rooms) > 0){
+      # cat("\nIncluded Rooms: ", paste0(included.rooms, collapse=","))
+      positive.rooms <- c(positive.rooms, included.rooms)
+    }
+    
+    if(length(negative.rooms) > 0){
+      # cat("\nNegative Rooms: ", paste0(negative.rooms, collapse=","))
+    }
+  }
+  positive.rooms <- unique(unlist(positive.rooms))
+  negative.rooms <- unique(unlist(negative.rooms))
+  conflicts <- positive.rooms %in% negative.rooms
+  if(any(conflicts)){
+    stop("\nError: Ambiguous definitions. Rooms ", paste0(positive.rooms[conflicts], collapse=","), " appear to be included in both positive and negative sets.")
+  }
+  newState <- list(agents=aList, rooms=rList, positive.rooms=positive.rooms, negative.rooms=negative.rooms, time.range=tRange)
+  state.name <- name
+  if(is.null(state.name)){
+    state.name <- paste0("S.",length(program$states)+1)
+  }
+  if(length(program$states) <= 0){
+    state.name <- paste0("[Initial] ", state.name)
+  }
+  else{
+    # The fuzzy transition applies to the transition between the previous state and the one being defined
+    # Initially, states have no "fuzziness" since we don't know whether there will be more states defined later
+    attr(program$states[[length(program$states)]], "fuzzy") <- fuzzy
+  }
+  
+  class(newState) <- CLASS_NAMES$state
+  attr(newState, "processed") <- FALSE
+  
+  attr(newState, "look.behind.rooms") <- look.behind.rooms
+  attr(newState, "included.rooms") <- included.rooms
+  attr(newState, "excluded.rooms") <- excluded.rooms
+  attr(newState, "positive.rooms") <- positive.rooms
+  attr(newState, "negative.rooms") <- negative.rooms
+  attr(newState, "look.behind") <- length(look.behind.rooms) > 0
+  
+  attr(newState, "included.agents") <- included.agents
+  attr(newState, "negative.agents") <- negative.agents
+  attr(newState, "excluded.agents") <- excluded.agents
+  attr(newState, "name") <- state.name
+  attr(newState, "index") <-length(program$states)+1
+  attr(newState, "tag") <- paste0("S.",length(program$states)+1)
+  attr(newState, "string") <- state_to_string(newState)
+  
+  attr(program, "total.trace.rooms") <- unique(c(attr(program, "total.trace.rooms"), positive.rooms, negative.rooms))
+  program$states <- append(program$states, list(newState))
+  return(program)
+}
+
+trace.env$call.transition <- function(add.state.call, fuzzy=FALSE){
+  # Should fuzzy go on the previous state or on the new one?
+  post <- TRUE # At the moment only the post assignment works. This means that the RHS call will get fuzzy=TRUE
+  
+  # Considering that the last pipe operator will go to end_trace, it should definitely go on the previous state!
+  # So the meaning would be "The transition between this state and the next will be fuzzy
+  # add.state.call[[1]] is the function being called (in this case, the pipe operator)
+  # add.state.call[[2]] Is the LHS variable (In this case it's the program returned from the previous start_trace or add_state)
+  # add.state.call[[3]] Is the add_state or end_trace function call
+  add.state.call[[1]] <- quote(`%>%`)
+  if(post){
+    call <- add.state.call[[3]]
+    if(typeof(call) != "symbol" &&identical(call[[1]], sym("add_state"))){
+      call[["fuzzy"]] <- fuzzy
+      add.state.call[[3]] <- call
+    }
+  }
+  else{
+    # This cannot work since the functions are evaluated bottom up, so adding the argument to the previous call won't change the function call which was already evaluated
+    call <- add.state.call[[2]][[length(add.state.call[[2]])]]
+    if(typeof(call) != "symbol" && identical(call[[1]], sym("add_state"))){
+      call[["fuzzy"]] <- fuzzy
+    }
+  }
+  return(eval.parent(add.state.call))
+}
+
+trace.env$`%->%` <- function(lhs, rhs){
+  call <- match.call()
+  return(trace.env$call.transition(call, fuzzy=FALSE))
+}
+trace.env$`%-->%` <- trace.env$`%->%`
+
+trace.env$`%~>%` <- function(lhs, rhs){
+  call <- match.call()
+  return(trace.env$call.transition(call, fuzzy=TRUE))
+}
+trace.env$`%~~>%` <- trace.env$`%~>%`
+# 
+# trace.env$et_unique_agents <- function(room.col, data){
+#   return(unique(unlist(data[[room.col]])))
+# }
+# 
+# trace.env$exclude_cols <- function(data, exclude.cols=NULL){
+#     cols <- colnames(data)
+#     cols <- cols[!(cols %in% exclude.cols)]
+#     return(cols)
+# }
+# 
+# trace.env$get_all_unique_agents <- function(data, room.cols=NULL, exclude.cols=NULL){
+#   if(is.null(room.cols)){
+#     if(is.null(exclude.cols)) stop("You need to provide at least one of room.cols or exclude.cols")
+#     room.cols <- colnames(data)
+#     room.cols <- room.cols[!(room.cols %in% exclude.cols)]
+#   }
+#   return(sort(unique(unlist(mclapply(room.cols, get_unique_agents, data)))))
+# }
+```
+
+### Printing
+
+```{r}
+trace.env[[paste0("print.", trace.env$CLASS_NAMES$state)]] <- function(state){
+  cat("\nState Definition: ", trace.env$state_to_string(state))
+  cat("\nFuzzy transition to next state?: ", attr(state, "fuzzy"))
+  incl.agents <- paste0(attr(state, "included.agents"), collapse=",")
+  excl.agents <- paste0(attr(state, "excluded.agents"), collapse=",")
+  cat("\nAgents -\tIncluded: [", incl.agents, "]\tExcluded: ![", excl.agents, "]", sep="")
+  incl.rooms <- paste0(attr(state, "included.rooms"), collapse=",")
+  excl.rooms <- paste0(attr(state, "excluded.rooms"), collapse=",")
+  cat("\nRooms  -\tIncluded: [", incl.rooms, "]\tExcluded: ![", excl.rooms, "]", sep="")
+  if(attr(state, "processed")){
+    cat("Results:\n")
+    cat("Total state instances:\n", nrow(state$ranges))
+  }
+}
+.GlobalEnv[[paste0("print.", trace.env$CLASS_NAMES$state)]] <- trace.env[[paste0("print.", trace.env$CLASS_NAMES$state)]]
+
+trace.env$state_to_string <- function(state, prefix=""){
+  agents_string <- agents_to_string(state$agents)
+  rooms_string <- rooms_to_string(state$rooms)
+  return(paste0("〈 ",paste0(c(agents_string, rooms_string), collapse=", "), " 〉"))
+}
+```
+
+# 1. Trace Creation/Definition
+
+```{r}
+trace.env$find_time_col <- function(df){
+  col.types <- get_cols_classes(df, type="POSIXct|POSIXt")
+  return(col.types[1,])
+}
+#     empty.rows        rate
+# tsID          0 1.000000000
+# time          0 1.000000000
+# 15        36169 0.885439267
+# 32        38730 0.877327624
+# 33        42669 0.864851339
+# 24        97262 0.691934917
+# 28       149912 0.525172701
+# 18       176570 0.440736858
+# 34       176978 0.439444569
+# 14       188504 0.402937422
+# 26       231882 0.265543094
+# 27       279722 0.114015945
+# 22       282148 0.106331896
+# 23       289181 0.084055758
+# 25       291873 0.075529189
+# 30       292556 0.073365873
+# 29       304857 0.034404011
+# 31       305885 0.031147951
+# 12       308907 0.021576148
+# 16       310482 0.016587535
+# 13       312574 0.009961390
+# 17       312785 0.009293074
+# 20       314068 0.005229334
+# 21       314224 0.004735223
+# 11       315719 0.000000000
+# 19       315719 0.000000000
+
+
+trace.env$start_trace <- function(.data, time.col=NULL, room.cols=NULL, agents.list=NULL, parallel=FALSE, use.cpp=TRUE){
+  trace.env$use.cpp <- use.cpp
+  if("trace" %in% class(.data)){
+    warning("This object is already a trace. If you want to start a new one from a previous result, please select a reult trace from the list")
+    return(.data)
+  }
+  # If we're starting a new trace from a previous program's result
+  if(!is.list(.data)){
+    if("result" %in% names(.data)){
+      .data = copy(result)
+    }
+  }
+  
+  if(is.null(time.col)){
+    time.col <- find_time_col(.data)
+    cat("\nNo time column specified. Using the column ", time.col$name, ": ", time.col$class, "\n")
+    time.col <- time.col$name
+  }
+  id.col <- "tsID"
+  
+  .data <- .data[, c(id.col) := .I]
+  if(is.null(room.cols)){
+    room.cols <- colnames(.data)
+    room.cols <- room.cols[!(room.cols %in% c(time.col, id.col))]
+    cat("No list of rooms provided, using all columns except the time column: ", time.col, "\n",paste0(room.cols, collapse=","), "\n")
+  }
+
+  
+  cols <- colnames(.data)
+  cols <- c(id.col, cols[!(cols %in% id.col)])
+  .data <- .data[, ..cols]
+  
+  prefix= "\n[ST"
+  if(parallel){
+    n.cores <- ceiling(detectCores()*0.5)
+    setDTthreads(n.cores)
+    options("mc.cores" = n.cores)
+    prefix= paste0("\n[MT = ", getOption("mc.cores", 2L))
+  }
+  else{
+    setDTthreads(1)
+  }
+  if(use.cpp){
+    prefix= paste0(prefix, ", C++ check_fun")
+  }
+  else{
+    prefix= paste0(prefix, ", R check_fun")
+  }
+  prefix=paste0(prefix, "]")
+  
+  
+  obj <- list(data=.data, states=list())
+  attr(obj, "class") <- CLASS_NAMES$program
+  attr(obj, "parallel") <- parallel
+  attr(obj, "prefix") <- prefix
+  attr(obj, "time.col") <- time.col
+  attr(obj, "id.col") <- id.col
+  attr(obj, "room.cols") <- room.cols
+  attr(obj, "total.trace.rooms") <- c()
+  attr(obj, "threads") <- getOption("mc.cores")
+  # 
+  # if(is.null(agents_list)){
+  #   warning(paste0("No list of agents provided, scanning the dataset..."))
+  #   apply_fun <- get_apply_fun(obj)
+  #   agents.list <- apply_fun(room.cols, )
+  #   agents.list <- colnames(.data)
+  #   room.cols <- room.cols[!(room.cols %in% c(time.col, "tsID"))]
+  # }
+  attr(obj, "agents.list") <- agents.list
+  return(obj)
+}
+  
+trace.env$get_apply_fun <- function(program){
+  if(attr(program, "parallel")){
+    return(lapply)
+  }
+  return(lapply)
+}
+
+# start_random_trace <- function(time.col="time", room.cols=NULL, agents.list=NULL, parallel=TRUE){
+#   data <- start_trace()
+# }
+trace.env$print.program.summary <- function(program, min.trace.length=10, max.highlights=10){
+  if(is.null(program$result)) return()
+  all.agents <- unique(unlist(unname(lapply(program$states, function(s) s$agents))))
+  all.pos.rooms <- unique(unlist(unname(lapply(program$states, function(s) s$positive.rooms))))
+  all.neg.rooms <- unique(unlist(unname(lapply(program$states, function(s) s$negative.rooms))))
+  total.traces <- length(program$result$traces)
+  cat("\nAgents followed: ", paste0(all.agents, collapse=","), sep="")
+  cat("\nRooms: ", paste0(all.pos.rooms, collapse=","), sep="")
+  cat("\n\t- Included: ", paste0(all.pos.rooms, collapse=","), sep="")
+  cat("\n\t- Excluded (negative? not sure yet): ", paste0(all.neg.rooms, collapse=","), sep="")
+  cat("\n\nTotal traces: ", total.traces, sep="")
+  highlight.title.printed <- FALSE
+  n.highlights <- 0
+  for(i in 1:length(program$result$traces)){
+    if(nrow(program$result$traces[[i]]) > min.trace.length){
+      if(!highlight.title.printed){
+        cat(". Highlighted traces (n > ", min.trace.length, "): ", sep="")
+        highlight.title.printed <- TRUE
+      }
+      cat("\n- Trace ", i, ". Length: " , nrow(program$result$traces[[i]]), sep="")
+      states.summary <- program$result$traces[[i]][, .N, by=tag][!(tag %like% "peek"),][str_length(tag) <= 0, tag := "None"]
+      no.state.summary <- states.summary[tag == "None",]
+      no.state.summary <- ifelse(nrow(no.state.summary) > 0, paste0(" ", no.state.summary$tag, ": ", no.state.summary$N), "")
+      states.summary <-  states.summary[tag != "None",]
+      states.summary.sizes <- apply(states.summary, 1, function(x) paste0("\t  ", x[["tag"]], ": ", x[["N"]]))
+      states.summary.text <- paste0(states.summary.sizes)
+      cat("\n   States summary:", no.state.summary, states.summary.text, "\n")
+      n.highlights <- n.highlights + 1
+    }
+    if(n.highlights >= max.highlights && i < length(program$result$traces)){
+      cat("\n... And more (max highlights displayed: ", max.highlights)
+      break
+    }
+  }
+}
+trace.env[[paste0("print.", trace.env$CLASS_NAMES$program)]] <- function(program){
+  cat(trace.env$program_to_string(program), "\n")
+  print.program.summary(program)
+  cat("\n", trace.env$program_to_string(program), "\n")
+}
+.GlobalEnv[[paste0("print.", trace.env$CLASS_NAMES$program)]] <- trace.env[[paste0("print.", trace.env$CLASS_NAMES$program)]]
+
+```
+
+## Printing Functions
+
+```{r}
+trace.env$program_to_string <- function(program){
+  expr <- ""
+  if(length(program$states) <= 0){
+    return("\nThe trace has no states yet! Add a state with `add_state(agents(...), rooms(...)")
+  }
+  for(i in 1:length(program$states)){
+    state <- program$states[[i]]
+    expr <- paste0(expr, state_to_string(state))
+    if(i < length(program$states)){
+      transition <- " ~> "
+      if(!is.null(attr(state[[i]], "fuzzy")) && !attr(state[[i]], "fuzzy")) transition <- " -> "
+      expr <- paste0(expr, transition)
+    }
+  }
+  return(expr)
+}
+
+trace.env$print_trace <- function(program, traceIdx){
+  append_room_res <- function(roomRes1, roomRes2){
+    # cat(append(roomRes1, roomRes2))
+    return(append(roomRes1, roomRes2))
+  }
+  set_state_bit <- function(statesBitsCol, stateBitsCol, stateIdx){
+    statesBitsCol[[stateIdx]] <- stateBitsCol
+    return(statesBitsCol)
+  }
+  if(is.null(program$result$traces[traceIdx])){
+    stop("Error: The program has no traces. Have you ended the trace with `end_trace()`?")
+  }
+  traceSummary <- copy(program$result$traces[[traceIdx]][,"tsID"])
+  traceSummaryRowsIdx <- which(program$data[, tsID == traceSummary[['tsID']]])
+  for(i in 1:length(program$states)){
+    state <- program$states[[i]]
+    for(room in names(state[["_results"]])){
+      room_res <- state[["_results"]][[room]][traceSummaryRowsIdx]
+      if(!(room %in% colnames(traceSummary))){
+        traceSummary[[room]] <- rep(list(rep(NA, length(program$states))), nrow(traceSummary))
+      }
+      # traceSummary[[room]] <- Map(append_room_res, traceSummary[[room]], room_res)
+      traceSummary[[room]] <- Map(function(x,y) set_state_bit(x,y,i), traceSummary[[room]], room_res)
+    }
+  }
+  return(traceSummary)
+}
+
+```
+
+# States Application
+
+Now that we have defined the program with its states, we should define
+how this runs. We need to follow some rigorous steps to both make it
+simpler but more importantly to optimize it as it might be working on
+huge datasets:
+
+1.  We first need to be able to retrieve the results for each state.
+    Let's call it `state application` since we are applying the state to
+    the data-set
+2.  To identify traces we need to be able to apply at least one state,
+    and an initial and final state if more than one state are defined
+3.  If more than two states are defined then we then have to filter out
+    the start-end traces to see whether the transitionals states happen
+    in between
+4.  In order to apply a state we need to:
+    1.  Be able to check whether:
+        -   Sets: At least one of the agents is in the cell
+        -   Groups: ALL of the agents are in the cell
+        -   Range: The number of agents in the cell is within the range
+    2.  To do this we need one essential functions:
+        -   To check whether a set of agents is inside the cell
+
+        -   To check the number of agents in the cell
+
+## Basic Checking Functions
+
+Refer to `Utils/CheckingFunctions.Rmd` for both R and CPP
+implementations
+
+```{r}
+source("R/generated/CheckingFunctions.R")
+```
+
+### Vertical: Room Column Checks
+
+Now that we know how to retrieve the unique IDs we can run checks on
+each room (column):
+
+```{r}
+trace.env$check_room <- function(room_col, sets, groups, range, col.name="", verbose=TRUE, debug=FALSE){
+  if(verbose){
+    cat("\rChecking Room \t ", paste0(col.name, collapse = ","), " Total rows: ", length(room_col), "\t")
+  }
+  if(!is.null(trace.env$use.cpp) && trace.env$use.cpp){
+    return(unlist(lapply(room_col, check_cell_cpp, sets, groups, range)))
+  }
+  else{
+    return(unlist(lapply(room_col, check_cell, sets, groups, range, debug)))
+  }
+}
+```
+
+### Horizontal: Combine Room Column Results In Time
+
+We now need to combine the results of the state checks from each room's
+column with the other columns, we need to be mindful of:
+
+-   **Positive rooms**: The criteria is for the agents to be present:
+
+    -   Set of rooms: We can OR the result, as long as the criteria is
+        TRUE for one of the rooms we can return TRUE for the time slot
+        (row)
+
+    -   Group of rooms: ?? (not sure now, but when I'll remember I'll
+        write it down)
+
+-   **Negative rooms**: The criteria is for the agents NOT to be in the
+    room:
+
+    -   Set of rooms: We need to be careful here! If a room is has the
+        `not.in` flag, we should NEGATE the result of the whole room
+        column's check. THe idea here is that the selected agents should
+        NOT be in this room.
+
+        -   This is not the same as negating the agent set. The cell
+            might still be TRUE when the not-agent is absent, however,
+            the query might be asking for "the instances without that
+            agent" to NOT be in the set of rooms
+
+        -   This is much easier with positive agents sets: The cell
+            might be TRUE when the selected agents are in it, but we are
+            asking for instances where agents were NOT in that
+            room/column
+
+## Time Grouping
+
+Now that we have the combined results for each time slot we should group
+the resulting consecutive time slots together.
+
+To do this we can:
+
+1.  Look for jumps where the difference between a row's timeID an the
+    previous row's timeID is larger than 1
+
+2.  If it is, it means we might be starting a new trace. This is true
+    whether it is fuzzy or not, otherwise we'd just select the whole
+    dataset!
+
+3.  After a jump, the state might be true for some consecutive time
+    slots, we need to add these to the group!
+    
+The function being used `customRLE()` can be sourced from `Notebooks/Utils/utility_functions.cpp`
+
+```{r}
+trace.env$merge_state_results <- function(data, combined_results, time.range=NULL, info.print=TRUE){
+  jumps <- data[combined_results, c("tsID")]
+  jumps <- jumps[, stateID := .I]
+  jumps <- jumps[, diff := tsID - data.table::shift(tsID, 1L, type="lag")]
+  jumps$diff[[1]] <- 1 # Avoid the first row being NA
+  
+  # Run-Length Encoding to avoid iterating through subsequent rows.
+  # The custom RLE merges the first row with diff > 1 with all the subsequent rows with diff <= 1
+  # At the end, all the consecutive rows after a big jump are assigned the same group ID to be used for merging
+  jumps$group <- customRLE(jumps$tsID, jumps$diff)
+  
+  # Just merge them together selecting the first for the startID and the last for the endID
+  ranges <- jumps[, list(start=first(tsID), end=last(tsID)), by=.(group)]
+  
+  # For debug purposes
+  ranges$size <- (ranges$end - ranges$start) + 1
+  if(!is.null(time.range)){
+    # tRange <- state$times
+    ranges <- ranges[size >= time.range[[1]] & size <= time.range[[2]],]
+  }
+  list(ranges=ranges, jumps=jumps)
+}
+```
+
+## Apply a state
+
+```{r}
+trace.env$apply_state <- function(program, data, state, apply_fun=NULL, prefix="", force=FALSE, info.print=TRUE, per.row=FALSE, id.cols=c("tsID", "time"), non.empty.data=NULL){
+  apply_fun <- lapply
+  state.name <- attr(state, "name")
+  state.string <- attr(state, "string")
+  if(attr(state,"processed") && !force){
+    warning("State ", state.name, " has already been processed. If you want to re-process it you can call `apply_program_state(program, state_idx, force=TRUE)`")
+    return(state)
+  }
+  if(info.print){
+    state_type <- ""
+    if(attr(state, "look.behind")){
+     state_type <- "(look.behind)"
+    }
+    cat(prefix," Applying ", state_type," State ", state.name, state.string, " on ", nrow(data), " time slots.")
+    cat("\nRooms:  +", length(state$positive.rooms), " [", paste0(unlist(state$positive.rooms), collapse=","), "]", sep="")
+    cat("\t -", length(state$negative.rooms), " [", paste0(unlist(state$negative.rooms), collapse=","), "]", sep="")
+  }
+  
+  start_time <- Sys.time()
+  if(!per.row){
+    cat("\n")
+    rooms.to.check <- c(state$positive.rooms, state$negative.rooms)
+    all.cols <- c(id.cols, rooms.to.check)
+    rooms.results <- data[, ..all.cols]
+      
+    sets <- get_sets(state$agents)
+    groups <- get_groups(state$agents)
+    range <- unlist(get_ranges(state$agents))
+    cols.to.check <- c(state$positive.rooms)
+    if(length(cols.to.check) > 0){
+      rows.to.skip <- rep(FALSE, nrow(data)) # Initially, no time slot has been checked yet so they're all set to TRUE to be checked
+      for(r in 1:length(cols.to.check)){
+        room.col <- cols.to.check[[r]]
+        rooms.results[[room.col]] <- rows.to.skip
+        # If we have data regarding which rows are empty in this column, we can already mark those as FALSE since they won't be containing the set or the range for sure
+        # if(!is.null(non.empty.data)){
+        #   rooms.results[[room.col]] <- TRUE
+        #   non.empty.rows <- non.empty.data[[room.col]]
+        #   rooms.results[non.empty.rows, (room.col) := FALSE]
+        #   selected.rows <- comb & rooms.results[[room.col]]
+        # }
+        data.to.check <- data[!rows.to.skip,][[room.col]]
+        rooms.results[!rows.to.skip, (room.col) := check_room(data.to.check, sets, groups, range, col.name=room.col)] # With data.table
+        rows.to.skip <- rows.to.skip | rooms.results[[room.col]] # After checking the room, we only keep the ones that are still TRUE because the others should obviously be discarded (positive room)
+      }
+      rooms.results$pos.c <- rows.to.skip # The rows we skipped are the ones that had at least one TRUE in the row!
+    }
+    
+    cols.to.check <- c(state$negative.rooms)
+    if(length(cols.to.check) > 0){
+      rows.to.skip <- rep(TRUE, nrow(data))
+      for(r in 1:length(cols.to.check)){
+        room.col <- cols.to.check[[r]]
+        rooms.results[[room.col]] <- rows.to.skip
+        data.to.check <- data[rows.to.skip,][[room.col]]
+        # If the set or group is in the room then we have to negate the result since this is a negative room and the agents should NOT be there
+        rooms.results[rows.to.skip, (room.col) := !check_room(data.to.check, sets, groups, range, col.name=room.col)] # With data.table
+        rows.to.skip <- rows.to.skip & rooms.results[[room.col]]
+      }
+      rooms.results$neg.c <- rows.to.skip
+    }
+    # Data table is much faster. One columnd on 315719 rows: DT = 1.931, DPLYR = 2.467
+    # rooms.results <- rooms.results %>% mutate(across(all_of(rooms.to.check), ~ check_room(.x, state$agents, cur_column()))) # with dplyr
+    
+    # Initially, all the rows are TRUE so the combination of positive and negative rooms will return TRUE for everything
+    rooms.results$combined <- rep(TRUE, nrow(rooms.results))
+    if(length(state$positive.rooms) > 0){
+      # For positive rooms, we need to start with all rooms to FALSE otherwise the | (column-wise OR) will always return TRUE
+      cols <- c(state$positive.rooms)
+      # rooms.results$pos.c  <- Reduce(`|`, rooms.results[, ..cols])
+      colnames(rooms.results)[colnames(rooms.results) %in% cols] <- paste0("+", cols)
+      rooms.results$combined <- rooms.results$combined & rooms.results$pos.c
+    }
+    
+    if(length(state$negative.rooms) > 0){
+      # For negative rooms, we need to start with all rooms to TRUE otherwise the & (column-wise AND) will always return FALSE
+      cols <- c(state$negative.rooms)
+      # rooms.results$neg.c  <- Reduce(`&` , rooms.results[, ..cols])
+      colnames(rooms.results)[colnames(rooms.results) %in% cols] <- paste0("-", cols)
+      rooms.results$combined <- rooms.results$combined & rooms.results$neg.c
+    }
+    
+    merged <- merge_state_results(data, rooms.results$combined, time.range=state$time.range, info.print=info.print) # in the future, pass state$times to select time ranges
+  }
+  else{
+    # TODO
+    stop("Error: per.row state calculation not implemented yet")
+  }
+
+  if(info.print){
+    cat("\nFound  ", nrow(merged$ranges), " instances...")
+  }
+  
+  state$ranges <- merged$ranges
+  state$ranges$state <- state.name
+  state$results <- rooms.results
+  
+  attr(state, "processed") <- TRUE
+  
+  end_time <- Sys.time()
+  elapsed <- end_time - start_time
+  if(info.print){
+    cat("\t > Exec Time: ", elapsed, "s\n", sep="")
+  }
+  attr(state, "exec_time") <- elapsed
+  
+  return(state)
+}
+```
+
+### Apply the state to the program
+
+Here we just call `apply_state()` on the last state, useful when
+debugging and wanting to apply the states in a staggered manner instead
+of letting `end_trace()` do the work
+
+```{r}
+trace.env$apply_program_state <- function(program, state_idx=-1, force=TRUE){
+  if(state_idx <= 0){
+    state_idx <- length(program$states) # Apply the last defined state
+  }
+  state <- program$states[[state_idx]]
+  apply_fun <- get_apply_fun(program)
+  prefix <- attr(program, "prefix")
+  info.print <- !attr(program, "parallel")
+  id.cols <- c(attr(program, "id.col"), attr(program, "time.col"))
+  program$states[[state_idx]] <- apply_state(program, program$data, program$states[[state_idx]], apply_fun, prefix, force, info.print=info.print, id.cols=id.cols, non.empty.data=attr(program, "non.empty.data"))
+  return(program)
+}
+```
+
+# Combining States
+
+### Extract Start and End of traces
+
+This is possibly the most important part of the tool and the algorithm.
+It works as follows: 1. We need to select the first and the last state
+since they are the delimiters 2. They can happen at any time and
+multiple times in sequence (e.g an agent stays in a room) 3. So we first
+need to retrieve all the `tsIDs` of where the first (start) state
+happend and then the same for the second (end) state 4. Now we can pack
+the consecutie `IDs` together. The Run-Length Encoding (RLE) works great
+for this. So after calculating `diff` which tells us how much difference
+there is between one row and the next one, we'll know whether there is
+any jump between the `tsID`s. That for us is the end/start of a trace 5.
+Now that we know we can group together the ones with `diff == 1` and -
+Select the first `tsID` if it's the start state (to select the first
+time since the state was TRUE) - Select the last `tsID` if it's the end
+state (again to include all the instances in which the state was TRUE)
+
+```{r}
+# shift=TRUE means that the ranges should be shifted to allow for identical initial and final states
+trace.env$merge_ranges <- function(range1, range2, shift=FALSE, extended=FALSE){
+  # cat("\nMerging ranges, ", nrow(range1), "-", nrow(range2))
+  i <- 1
+  prevStartT <- -1
+  merged.ranges <- list(start=c(), end=c())
+  range1$keep <- FALSE
+  range2$keep <- TRUE
+  
+  if(shift){
+    range2 <- range2[, c("end") := data.table::shift(end, 1L, type="lead")]
+    # in case of shift, the last row of the end state will be NA
+    range2 <- range2[!is.na(end), ]
+  }
+    
+  while(i <= nrow(range2)){
+    endT <- range2$end[[i]]
+    startInEnd <- range1[start <= endT & start > prevStartT,]
+    # Not sure about this extended, is it really needed? does it even work?
+    if(extended || shift){
+      startT <- first(startInEnd)$start
+    }
+    else{
+      startT <- last(startInEnd)$start
+    }
+    if(nrow(startInEnd) > 0 ){
+      if(!is.na(startT) && !is.null(startT)){
+        prevStartT <- startT
+        if(extended){
+          prevStartT <- last(startInEnd)$start
+        }
+        merged.ranges$start <- c(merged.ranges$start, startT)
+        merged.ranges$end <- c(merged.ranges$end, endT)
+        range1[start <= endT & start > prevStartT, keep := TRUE]
+      }
+    }
+    i <- i+1
+  }
+  return(data.table(as.data.frame(merged.ranges)))
+}
+
+trace.env$compare_ranges <- function(range1, range2){
+  if(nrow(range1) != nrow(range2)) return(FALSE)
+  comparison <-  range1[["start"]] == range2[["start"]] & range1[["end"]] == range2[["end"]]
+  return(!(any(comparison == FALSE)))
+}
+# Here we need to decide whether fuzzy includes all the previous instances in which State 1 was true right before State 2
+trace.env$extract_start_end_traces <- function(program, fuzzy = TRUE, extended = FALSE){
+  prefix <- attr(program, "prefix")
+  cat(prefix, "Merging initial and final state...")
+  start_time <- Sys.time()
+  
+  data <- program$data
+  starting.state.name <- attr(program$states[[1]], "name")
+  ending.state.name <- attr(program$states[[length(program$states)]], "name")
+  starting_state_results <- program$states[[1]]$ranges
+  ending_state_results <- program$states[[length(program$states)]]$ranges
+  
+  is.return <- FALSE
+  if(length(program$states) > 1){
+    is.return <- compare_ranges(starting_state_results, ending_state_results)
+    # common.rooms <- program$states[[1]]$positive.rooms %in% program$states[[length(program$states)]]$positive.rooms
+    # if(any(common.rooms == TRUE)){
+    #   is.return <- TRUE
+    #   common.rooms <- program$states[[1]]$positive.rooms[common.rooms]
+    #   cat("\n!! RETURN TRIP DETECTED. Starting and final state include the same rooms: ", paste0(common.rooms, collapse=","), " !!\n")
+    # }
+  }
+  if(is.return){
+      cat("\n!! RETURN TRIP DETECTED. Initial state == Final state !!\n")
+  }
+  ranges <- merge_ranges(starting_state_results, ending_state_results, is.return)
+  ranges$size <- ranges$end - ranges$start
+  # ranges$tag <- starting.state.name
+  if(nrow(ranges) <= 0){
+    warning("No results found")
+    return(list(start=starting_state_results, end=ending_state_results, ranges=ranges, traces=list()))
+  }
+  program$states[[1]]$filtered.ranges <- starting_state_results
+  program$states[[length(program$states)]]$filtered.ranges <- ending_state_results
+  traces <- get_traces_from_ranges(data, ranges, id.col=attr(program, "id.col"), time.col=attr(program, "time.col"))
+  end_time <- Sys.time()
+  elapsed <- end_time - start_time
+  cat("\t > Exec Time: ", elapsed, "s\n", sep="")
+  return(list(start=starting_state_results, end=ending_state_results, ranges=ranges, traces=traces))
+}
+```
+
+## Extract traces from the combined ranges
+
+```{r}
+trace.env$get_traces_from_ranges <- function(data, rangesList, tag="", id.col="tsID", time.col="time"){
+  cat("\nExtracting", nrow(rangesList), "traces from dataset... ")
+  traces <- apply(rangesList, 1, function(x, id.col, time.col){
+    trace <- data[get(id.col) >= x[["start"]] & get(id.col) <= x[["end"]], ]
+    attr(trace, "id.col") <- id.col
+    attr(trace, "time.col") <- time.col
+    return(trace)
+    }, id.col, time.col)
+  return(traces)
+  # This is faster but gives problems when the previous end ID is the same as the next start ID as the trace.idx would get ovewritten
+  # trace.i <<- 1
+  # data$trace.idx <- -1
+  # apply(rangesList, 1, function(x) {
+  #   data[tsID >= x[["start"]] & tsID <= x[["end"]], c("trace.idx") := trace.i]
+  #   trace.i <<- trace.i+1
+  #   })
+  # return(data[trace.idx >= 0, ])
+}
+```
+
+### Filter by intermediate states
+
+TO DOUBLE CHECK After we split the traces by the the start and end steps
+we need to check whether each of them contains all of the transitions.
+The way it works is fairly simple:
+
+1.  We know where each trace starts and ends
+
+2.  Now we need to check whether each one of them includes the
+    transition we are looking for, each transition is represented by a
+    state and we know where the states happened thanks to the summary
+    from the `apply_state()` function (jumps and ranges)
+
+3.  Now we just need to take the ranges of the trace from the
+    intermediate states and check whether those ranges are included in
+    each trace
+
+4.  If they are, we can keep the trace, otherwise we'll discard it so
+    when we'll look at the next intermediate state we don't need to
+    check that trace again
+
+```{r}
+trace.env$filter_traces <- function(traces.ranges, state.ranges){
+    state_in_trace <- function(state.ranges, trace.ranges){
+      is.in_range <- function(s.range){
+        trace.ranges[["start"]] <= s.range[["start"]] && s.range[["end"]] <= trace.ranges[["end"]]
+      }
+      
+      filtered.states <- unlist(apply(state.ranges, 1, is.in_range))
+      states.in_trace <- state.ranges[filtered.states,]
+      # cat(paste0(any_in_range), "\n\n")
+      return(filtered.states)
+    }
+    
+    filtered <- unlist(apply(traces.ranges, 1, state_in_trace, state.ranges))
+    return(filtered)
+}
+
+trace.env$pre_filter <- function(program, apply_fun=NULL, prefix="", info.print=FALSE){
+  if(is.null(apply_fun)) apply_fun <- lapply
+  traces_to_keep <- rep(TRUE, length(program$result$traces))
+  for(i in 2:(length(program$states)-1)){
+    state.name <- attr(program$states[[i]], "name")
+    state.string <- attr(program$states[[i]], "string")
+    cat(prefix, " Applying and checking (transitional) state ", state.name, "\t", state.string, " ...", sep="")
+    program$states[[i]] <- apply_state(program, program$data, program$states[[i]], apply_fun, prefix, non.empty.data=attr(program, "non.empty.data"))
+    updated_traces_to_keep <- traces_contain_state(program$result$ranges, program$states[[i]]$ranges)
+    traces_to_keep <- traces_to_keep & updated_traces_to_keep
+  }
+  program$result$ranges <- program$result$ranges[traces_to_keep]
+  program$result$traces <- program$result$traces[traces_to_keep]
+  return(program)
+}
+
+trace.env$post_filter <- function(program, apply_fun=NULL, prefix="", info.print=FALSE){
+  if(is.null(apply_fun)) apply_fun <- lapply
+  total.traces <- length(program$result$traces)
+  traces_to_keep <- rep(TRUE, total.traces) # Initially, we would like to keep all the traces
+  # We need to apply each intermediate state to the resulting traces
+  # So for each intermediate state....
+  for(i in 2:(length(program$states)-1)){
+    state.name <- attr(program$states[[i]], "name")
+    state.string <- attr(program$states[[i]], "string")
+    cat(prefix," Applying State ", state.name, state.string, "on ", length(program$result$traces), " traces...\n", sep="")
+    # And for each resulting trace...
+    state.ranges <- NULL # This will be a datat.table containing all the state traces ranges we are keeping
+    # TODO
+    # state.res <- program$result$traces[, apply_state(.SD, program$states[[i]], apply_fun, prefix, info.print=info.print), by = .(trace.idx)]
+    for(j in 1:(length(program$result$traces))){
+      # IF the trace has already been marked as NOT to keep from a previous state then
+      # no point in checking the other states. Each trace should contain ALL states
+      if(!traces_to_keep[j]) next 
+      
+      # Obviously, if for some reason this is an empty trace, just skip it, but mark it to delete so we don't need to check again
+      # cat(prefix, " Trace ", j, ": ", nrow(program$result$traces[[j]]), " rows... ")
+      if(nrow(program$result$traces[[j]]) <= 0){
+        cat("Skipping\n")
+        traces_to_keep[[j]] <- FALSE
+        next
+      }
+      data <- program$result$traces[[j]]
+      # Now we can apply the intermediate state on the trace. The data we are using is the one from the current trace being checked
+      state_res <- apply_state(program, data, program$states[[i]], apply_fun, prefix, info.print=info.print, non.empty.data=attr(program, "non.empty.data"))
+      traces_to_keep[[j]] <- FALSE # Start with FALSE
+      # Then if there are actually some results, we can keep it
+      if(nrow(state_res$ranges) > 0){
+        traces_to_keep[[j]] <- TRUE
+        # Initialise the list of state ranges we are keeping
+        if(is.null(state.ranges)){
+          state.ranges <- state_res$ranges
+        }
+        else{
+          state.ranges <- rbind(state.ranges, state_res$ranges)
+        }
+      }
+      if(info.print && !traces_to_keep[[j]]){
+        cat("\nTrace: ", j, " [", nrow(program$result$traces[[i]]), "x", ncol(program$result$traces[[i]]), "] DISCARDED", sep="")
+        cat("\t(State ", state.name, " not found)", sep="")
+      }
+    }
+    program$states[[i]]$filtered.ranges <- state.ranges
+  }
+  program$result$ranges <- program$result$ranges[traces_to_keep]
+  program$result$traces <- program$result$traces[traces_to_keep]
+  return(program)
+}
+
+trace.env$filter_by_intermediate_states <- function(program, pre.filtering=FALSE, fuzzy=TRUE, verbose=TRUE){
+  if(length(program$states) <= 2){
+    warning("\nNo intermediate states to check. Number of states <= 2\n")
+    return(program)
+  }
+  prefix <- attr(program, "prefix")
+  apply_fun <- get_apply_fun(program)
+  
+  cat(prefix, "Checking intermediate transition states...")
+  cat("\nStart-End traces before: ", length(unique(program$result$tracesDT$trace.idx)))
+  info.print <- !attr(program, "parallel")
+  start_time <- Sys.time()
+  if(pre.filtering){
+    cat(prefix, "\nUsing pre-states filtering: Checking intermediate states on the whole dataset before filtering start-end states")
+    program <- pre_filter(program, apply_fun, prefix, info.print)
+  }
+  else{
+    cat(prefix,"\nUsing post-states filtering: Checking intermediate states for each trace resulting from start-end states computation")
+    program <- post_filter(program, apply_fun, prefix, info.print)
+  }
+  end_time <- Sys.time()
+  elapsed <- end_time - start_time
+  cat("\nAll intermediate transition states checked.\t > Exec Time: ", elapsed, "s", sep="")
+  cat("\n\nRemaining traces:", length(unique(program$result$traces)))
+  return(program)
+}
+
+trace.env$str_concat <- function(pre.tag, sep, post.tag){
+  if(str_length(pre.tag) <= 0){
+    return(post.tag)
+  }
+  return(paste0(pre.tag, sep, post.tag))
+}
+trace.env$add_tag <- function(tag.col, sep, new.tag){
+  return(unlist(lapply(tag.col, str_concat, sep, new.tag)))
+}
+trace.env$tag_trace <- function(trace, state, state.numbering=FALSE, tmpenv=NULL){
+  if(!is.null(tmpenv)){
+    cat(tmpenv$i , ",", sep="")
+    tmpenv$i <- tmpenv$i+1
+  }
+  s.ranges <- state$filtered.ranges
+  if(is.null(state$filtered.ranges)){
+    s.ranges <- state$ranges
+    if(is.null(s.ranges)){
+      cat("NO ranges found")
+      return(trace)
+    }
+  }
+  state.tag <- attr(state, "tag")
+  state.index <- attr(state, "index")
+  separator <- ","
+  if(!("tag" %in% colnames(trace))){
+    trace$tag <- ""
+    separator <- ""
+    if(state.numbering){
+      trace$state.n <- Inf
+    }
+  }
+  for(i in 1:nrow(s.ranges)){
+    state.start <- s.ranges[i,]$start
+    state.end <- s.ranges[i,]$end
+    if(state.numbering){
+      trace[tsID >= state.start & tsID <= state.end, c("tag", "state.n") := list(add_tag(tag, ", ", state.tag), state.index)]
+    } else{
+      trace[tsID >= state.start & tsID <= state.end, tag := add_tag(tag, ", ", state.tag)]
+    }
+  }
+  return(trace)
+}
+```
+
+## Ending a trace (for optimisation)
+
+### Getting room occupancy
+
+This is to avoid checking empty rows as well as sorting the rooms in a
+decreasing occupancy rate order. In this way the first columns to be
+checked will be the ones with the highest occupancy rate and therefore a
+higher chance of finding something. Once we found something we can
+short-circuit and reduce the amount of rows to be checked even more.
+
+```{r}
+trace.env$get_rooms_occupancy <- function(.data, use.dt=TRUE){
+  tmpenv <- new.env()
+  tmpenv$i <- 1
+  rooms.cols <- names(.data)
+  tmpenv$rooms.cols <- rooms.cols
+  
+  get.empty.cells <- function(room.col, tmpenv){
+    empty.cells <- lapply(room.col, is_cell_empty)
+    cat(tmpenv$rooms.cols[[tmpenv$i]], " (", length(empty.cells[empty.cells == FALSE]), "), ", sep="")
+    tmpenv$i <- tmpenv$i+ 1
+    return(which(empty.cells == FALSE))
+  }
+  cat("\nChecking room: ")
+  empty.cols <- apply(.data[, ..rooms.cols], 2, get.empty.cells, tmpenv)
+  if(!is.list(empty.cols)) empty.cols <- list(empty.cols)
+  names(empty.cols) <- rooms.cols
+  cat("\n")
+  return(empty.cols)
+}
+```
+
+```{r}
+trace.env$end_trace <- function(program, pre.filtering=FALSE, verbose=TRUE, optimise.rooms=TRUE){
+  start_time <- Sys.time()
+  # traceAgents <- get_program_agents(program)
+  if(optimise.rooms){
+    room.cols <- attr(program, "room.cols")
+    cat("Calculating room occupancy for optimised scanning...")
+    non.empty.cells <- get_rooms_occupancy(program$data[, ..room.cols])
+    occupancy <- lapply(non.empty.cells, function(x) length(x) / nrow(program$data))
+    attr(program, 'occupancy') <- occupancy
+    threshold <- 0.001
+    discarded <- occupancy[occupancy < threshold]
+    cat("\nDiscarded columns (occupancy rate <= ", threshold, ") ", paste0(names(discarded), " (", sprintf(discarded, fmt = '%#.2f'), ") "))
+    kept <- occupancy[occupancy >= threshold]
+    
+    all.cols <- c(attr(program, "id.col"), attr(program, "time.col"), names(kept))
+    program$data <- program$data[, ..all.cols]
+    
+    kept <- kept[order(unlist(kept), decreasing=TRUE)]
+    room.cols <- names(kept)
+    attr(program, 'non.empty.data') <- non.empty.cells[names(non.empty.cells) %in% room.cols]
+    attr(program, "room.cols") <- room.cols
+    cat("\nKept columns: ",paste0(names(kept), " (", sprintf(kept, fmt = '%#.2f'), ") "), "\n")
+    for(i in 1:length(program$states)){
+      rooms <- program$states[[i]]$negative.rooms
+      rooms <- rooms[rooms %in% room.cols]
+      program$states[[i]]$negative.rooms <- rooms[order(ordered(rooms, levels=room.cols))]
+      
+      rooms <- program$states[[i]]$positive.rooms
+      rooms <- rooms[rooms %in% room.cols]
+      program$states[[i]]$positive.rooms <- rooms[order(ordered(rooms, levels=room.cols))]
+    }
+  }
+  apply_fun <- get_apply_fun(program)
+  last_state <- program$states[[length(program$states)]]
+  attr(last_state, "name") <- paste0("[Final] ", attr(last_state, "name"))
+  program$states[[length(program$states)]] <- last_state
+  program <- apply_program_state(program, 1)
+  if(length(program$states) > 1){
+    program <- apply_program_state(program, length(program$states))
+  }
+  start_end_traces <- extract_start_end_traces(program, extended=FALSE)
+  program$result <- list(tracesDT=start_end_traces$traces, ranges=start_end_traces$ranges)
+  
+  if(length(program$states) > 2 && length(program$result$traces) > 0){
+    program <- filter_by_intermediate_states(program, pre.filtering, verbose)
+  }
+  
+  cat("\n")
+  if(length(program$result$traces) > 0){
+    cat("\n")
+    tmpenv <- new.env()
+    # YES! IT IS FASTER TO MERGE ALL THE TRACES INTO A DATA.TABLE AND THEN USE GROUPING TO RUN TAGGING!
+    all_traces <- rbindlist(program$result$traces, idcol="trace.idx")
+    for(i in length(program$states):1){
+      tmpenv[['i']] <- 0
+      cat("\rTagging state ", i, "/", length(program$states), " on ",  length(program$result$traces), " traces...", sep="")
+      all_traces <- tag_trace(all_traces, program$states[[i]], state.numbering=TRUE, tmpenv=tmpenv)
+      # program$result$traces <- apply_fun(program$result$traces, tag_trace, program$states[[i]], state.numbering=TRUE, tmpenv=tmpenv)
+    }
+    cat(" DONE!\n")
+    program$result$rooms <- t.rooms <- attr(program, "room.cols")
+    program$result$agents <- unique(unlist(unname(lapply(all_traces[str_length(all_traces$tag) > 0, ..t.rooms], function(x) unlist(unname(x))))))
+    program$result$traces <- unname(split(all_traces, by=c("trace.idx"), flatten=TRUE))
+    # If this is the second intermediate state we should only check the rows that are between the last instance of the previous intermediate state
+    # And the last instance of the final state, the states are SEQUENTIAL, with 4 states we can only have S1 -> S2 -> S3 -> S4
+    cat("Filtering by transitional states order...")
+    indirect.trans <- 0
+    incorrect.trans <- 0
+    traces_to_keep <- rep(TRUE, length(program$result$traces))
+    states_checked <- rep(FALSE, length(program$states))
+    for(i in 1:length(program$result$traces)){
+      trace <- program$result$traces[[i]]
+      trace <- trace[, state.diff := state.n - data.table::shift(state.n, 1L, type="lag")]
+      trace[1,][["state.diff"]] <- 0
+      trace <- trace[state.diff %in% c(Inf, -Inf, NaN), state.diff := 0]
+      # .GlobalEnv[["traceTest"]] <- trace # Use to keep intermediate results when the function crashes!
+      if(any(trace[["state.diff"]] < 0)){
+        neg.trans <- which(trace[["state.diff"]] < 0)[1]
+        range <- -1:0
+        trans.states <- trace[neg.trans + range,]$tag
+        # cat("\nDiscarding trace ", i, ":\tWrong transition order: ", paste(trans.states, collapse=" -> ", sep=""), sep="")
+        incorrect.trans <- incorrect.trans + 1
+        traces_to_keep[[i]] <- FALSE
+      }
+      if(!traces_to_keep[[i]]) next
+      prev.state <- program$states[[1]]
+      if(length(program$states) > 1){
+        for(j in 2:length(program$states)){
+          state <- program$states[[j]]
+          fuzzy.trans <- attr(prev.state, "fuzzy")
+          if(!fuzzy.trans){
+            from.state.index <- attr(prev.state, "index")
+            to.state.index <- attr(state, "index")
+            from.state.name<- attr(prev.state, "name")
+            to.state.name <- attr(state, "name")
+            if(!states_checked[[j]]){
+              cat("\nFiltering non-direct transitions between ", from.state.name, " and ", to.state.name, sep="")
+              states_checked[[j]] <- TRUE
+            }
+            from.ts <- last(trace[state.n == from.state.index,])[["tsID"]]
+            to.ts <- first(trace[state.n == to.state.index,])[["tsID"]]
+            in.between <- trace[tsID >= from.ts & tsID <= to.ts, ]
+            if(any(in.between$state.n %in% c(-Inf, NaN, Inf))){
+              traces_to_keep[[i]] <- FALSE
+              indirect.trans <- indirect.trans + 1
+              break
+            }
+          }
+          prev.state <- state
+        }
+      }
+      program$result$traces[[i]]$state.n <- NULL
+      program$result$traces[[i]]$state.diff <- NULL
+      program$result$traces[[i]]$trace.idx <- NULL
+    }
+    if(incorrect.trans > 0)
+      cat("\nDiscarded ", incorrect.trans, " traces with a wrong transition order", sep="")
+    if(indirect.trans > 0)
+      cat("\nDiscarded ", indirect.trans, " traces with a non-direct transition", sep="")
+    program$result$ranges <- program$result$ranges[traces_to_keep]
+    program$result$traces <- program$result$traces[traces_to_keep]
+  }
+  cat("\n\nTotal Traces: ", length(program$result$traces), ".\nUse `view_trace(program, trace.idx)`, `get_trace(program, trace.idx)` to get each individual trace")
+  end_time <- Sys.time()
+  elapsed <- end_time - start_time
+  cat("\n>Total exec time: ", elapsed, "s\n", sep="")
+
+  return(program)
+}
+```
+
+# Summary functions
+
+## Peek the result outside of the trace's bounds
+
+```{r}
+trace.env$get_peek_trace <- function(peekedTrace){
+  if(!is.null(peekedTrace$warning)) warning(peekedTrace$warning)
+  return(peekedTrace$trace)
+}
+
+trace.env$add_peek <- function(trace, program, peekSize, peekUpperBound, peekLowerBound, tmpenv, add.tags=TRUE,  dbg=FALSE){
+  data <- program$data
+  tmpenv$i <- tmpenv$i+1
+  original.cols <- colnames(trace)
+  firstTraceTime <- first(trace)[["tsID"]]
+  lastTraceTime <- last(trace)[["tsID"]]
+  msg <- NULL
+  if(firstTraceTime - peekSize < peekUpperBound || lastTraceTime + peekSize > peekLowerBound){
+      msg <- paste0("Peek outside of time range in Trace ", tmpenv$i)
+      msg <- paste0(msg, ". Trace Range: [", firstTraceTime, ", ", lastTraceTime, "]")
+      msg <- paste0(msg, ". Data Bounds: [", peekUpperBound, ", ", peekLowerBound, "]\n")
+      warning(msg)
+  }
+  # cat("\n Trace Time ", firstTraceTime, " - ", lastTraceTime, " Bounds: ",peekUpperBound, " - ", peekLowerBound,  sep="")
+  startPeekSize <- min(peekSize, abs(peekUpperBound-firstTraceTime))
+  endPeekSize <- min(peekSize, abs(peekLowerBound-lastTraceTime))
+  firstTraceTimePeeked <- firstTraceTime-startPeekSize
+  lastTraceTimePeeked <- lastTraceTime+endPeekSize
+  nTrace <- nrow(trace)
+  before <- data[tsID > firstTraceTimePeeked & tsID < firstTraceTime, ]
+  after <- data[tsID < lastTraceTimePeeked & tsID > lastTraceTime, ]
+  cat("\rTagging peek rows...", sep="")
+  for(i in 1:length(program$states)){
+    before <- tag_trace(before, program$states[[i]])
+    after <- tag_trace(after, program$states[[i]])
+  }
+  before$tag <- fifelse(str_length(before$tag) > 0, paste0("peek (", before$tag, ")"), "peek")
+  after$tag <- fifelse(str_length(after$tag) > 0, paste0("peek (", after$tag, ")"), "peek")
+  trace <- rbind(before, trace, after)
+  # cat("\n Trace Time after ", firstTraceTime, " - ", lastTraceTime, " Sizes: ", startPeekSize, ",", nTrace, ",", endPeekSize, sep="")
+  orderedCols <- c(original.cols)
+  trace <- trace[, ..orderedCols]
+  return(list(trace=trace, warning=msg))
+}
+
+trace.env$peek <- function(program, peekSize, add.tags=TRUE){
+  tmpenv <- new.env()
+  tmpenv[['i']] <- 0
+  
+  prefix <- attr(program, "prefix")
+  apply_fun <- get_apply_fun(program)
+  
+  cat(prefix, "Adding peek to", length(program$result$traces), "traces... ")
+  start_time <- Sys.time()
+  
+  peekUpperBound <- program$data[1][["tsID"]]
+  peekLowerBound <- program$data[nrow(program$data)][["tsID"]]
+  peekedTracesList <- lapply(program$result$traces, add_peek, program, peekSize, peekUpperBound, peekLowerBound, tmpenv, add.tags)
+  program$result$traces <- lapply(peekedTracesList, get_peek_trace)
+  end_time <- Sys.time()
+  elapsed <- end_time - start_time
+  cat("\t > Exec Time: ", elapsed, "s\n", sep="")
+  cat("\n Total Traces: ", length(program$result$traces), ".\nUse `view_trace(program, trace.idx)`, `get_trace(program, trace.idx)` to get each individual trace")
+  return(program)
+}
+```
+
+## Results selection
+
+The main selection function is `get_trace(...)`. The short-hand
+`trace[agents, rooms, duration]` or `trace[[trace_idx]]` can also be
+used. For instance:
+
+-   `res_trace[[1]]` returns the first resulting trace
+
+-   `res_trace[[-1]]` returns all resulting traces as one single merged
+    trace
+
+-   `res_trace[, c("r1", "r2")]` returns all traces but only selects
+    rooms `r1` and `r2` (If they were part of the query)
+
+-   `res_trace[, , 10]` returns all traces with a duration `>= 10`
+
+-   `res_trace[, , c(2, Inf)]` returns all traces with a duration
+    `2 <= x <= Inf`
+
+-   `res_trace[, c("r1", "r2"), c(2, Inf)]` returns all traces with a
+    duration `2 <= x <= Inf` but only selecting rooms `r1` and `r2`
+
+-   `res_trace["a1"]` returns all traces but clears out any room's cell
+    without `a1`
+    
+-   `res_trace[c("a1", "a2"), "r2"]` returns all traces where `a1` and `a2` were together but clears out any room's cell which does not contain both of them, it only returns `r2`
+
+```{r}
+trace.env$clean_result <- function(data, room.cols, agents){
+  filtered.data <- copy(data[, ..room.cols])
+  for(r in room.cols){
+    filtered.data[, (r) := check_room(data[[r]], NULL, list(agents), NULL, col.name=r, verbose=TRUE,debug=TRUE)] # With data.table
+  }
+  data[, room.cols] <- lapply(colnames(filtered.data), function(col){
+    ret <- Map(function(x,y){
+      if(!x) return(c())
+      return(y)
+    }, filtered.data[[col]], data[[col]])
+  })
+ return(data)
+}
+
+trace.env$non_empty_room <- function(cleaned.result, room.cols){
+  ret <- apply(cleaned.result[, ..room.cols], 1, function(x){
+    empty.room <- lapply(x, function(y) is.null(unlist(y)))
+    return(room.cols[which(empty.room == FALSE)][1])
+  })
+ return(ret)
+}
+
+trace.env$get_agent_journey <- function(data, room.cols, agents){
+  cleaned.result <- clean_result(data, room.cols, agents)
+  return(non_empty_room(cleaned.result, room.cols))
+}
+
+trace.env$view_trace <- function(...,title="Trace"){
+  View(get_trace(...), title)
+}
+
+trace.env$get_trace <- function(program, traceIdx=-1, agents=NULL, rooms=NULL, duration=NULL, keep.peek=TRUE, keep.rows=TRUE, verbose=TRUE, clear=TRUE){
+  if(is.null(program$result$traces)){
+    stop("Error: Program does not contain any trace (did you end the trace or applied individual states?)")
+  }
+  if(traceIdx > length(program$result$traces)){
+    stop(paste0("Error: Trace not in list (total resulting traces: ", length(program$result$traces)))
+  }
+  if(verbose){
+    if(traceIdx <= 0) cat("\nReturning all", length(program$result$traces), " traces\n")
+    else cat("\nReturning trace: ", traceIdx, "/", length(program$result$traces), "\n")
+  }
+  room_cols <- attr(program, "room.cols")
+  
+  msg <- ""
+  if(!is.null(rooms)){
+    rooms.in.trace <- (rooms %in% room_cols)
+    room_cols <- rooms[rooms.in.trace]
+    if(any(rooms.in.trace == FALSE)){
+      msg <- paste0("(Rooms: [", paste0(rooms[!rooms.in.trace], collapse=","), "] not found)")
+    }
+  }
+  if(verbose) cat("\nSelected Rooms: ", paste0(room_cols), msg)
+  cols <- c(attr(program, "id.col"), attr(program, "time.col"), room_cols)
+  
+  if(is.null(agents)){
+    msg <- " [Showing all agents in rooms]"
+    # agents <- program$summary$agents
+  }
+  else{
+    msg <- " [Only showing selected agents in rooms]"
+  }
+  
+  if(verbose) cat("\nSelected Agents: ", paste0(agents), msg, "\n")
+  
+ # if(verbose) cat("\nCols: ", paste0(cols), "\n")
+  if(traceIdx <= 0){
+    trace <- program$result$traces[[1]]
+    trace$trace_idx <- 1
+    if(length(program$result$traces) > 1){
+      for(i in 2:length(program$result$traces)){
+        new_trace <- program$result$traces[[i]]
+        new_trace$trace_idx <- i
+        trace <- rbind(trace, new_trace)
+      }
+    }
+  }
+  else{
+    trace <- program$result$traces[[traceIdx]]
+    trace$trace_idx <- traceIdx
+  }
+  
+  if(!is.null(duration)){
+    if(!is.list(duration) && length(duration) <= 1){
+      duration <- c(duration, duration)
+    }
+    if(verbose) cat("\nFiltering traces by duration: ", paste0(duration), "\n")
+    trace <- trace[, if(.N >= duration[[1]] & .N <= duration[[2]]) .SD, by=trace_idx]
+  }
+  
+  if("peek" %in% colnames(trace)){
+    cols <- c("peek", cols)
+  }
+  if("tag" %in% colnames(trace)){
+    cols <- c("tag", cols, "tag")
+  }
+  cols <- c(cols, "trace_idx")
+  trace <- trace[, ..cols]
+  
+  if(!is.null(agents)){
+    filtered.trace <- clean_result(trace, room_cols, agents)
+    agents.journey <- non_empty_room(filtered.trace, room_cols)
+    if(clear){
+      trace <- filtered.trace
+    }
+    trace$agents_room <- agents.journey
+  }
+  
+  # if(!timeSlots){
+  #   if(verbose) warning("\nWarning: Time slots filtering currently unsupported")
+  # }
+  if(!keep.peek){
+    if(verbose) warning("Warning: Removing peek rows, use `keep.peek=TRUE` to show them")
+    trace <- trace[peek != "peek",]
+  }
+  else{
+    if(verbose) warning("Keeping peek rows, use `keep.peek=FALSE` to filter them out")
+  }
+  if(!keep.rows){
+    if(verbose) warning("Warning: Filtering rows without a state, use `keep.rows=FALSE` to filter them out")
+    trace <- trace[!is.na(state),]
+  }
+  else{
+    if(verbose) warning("Warning: Keeping rows without a state, use `keep.rows=TRUE` to show intermediate rows")
+  }
+  return(trace)
+}
+
+trace.env$`[.Trace` <- function(x, agents, rooms, duration, idx=-1, clear=TRUE){
+  nA <- nargs()
+  has.a <- !missing(agents)
+  has.r <- !missing(rooms)
+  has.d <- !missing(duration)
+  # call.data <- match.call()
+  # print(call.data)
+  # print(call.data[[3]])
+  # print(typeof(call.data[[3]]))
+  # cat("\nhas.a=", has.a,"\thas.r=", has.r,"\thas.d=", has.d,sep="")
+  # cat("\n")
+  if(!has.a) agents=NULL
+  if(!has.r) rooms=NULL
+  if(!has.d) duration=NULL
+  return(get_trace(x, traceIdx=idx, agents=agents, rooms=rooms, duration=duration, clear=clear))
+}
+
+trace.env$`[[.Trace` <- function(x, idx=-1){
+  call.data <- match.call()
+  # print(call.data)
+  name <- call.data[[2]]
+  postfix <- ""
+  if(length(call.data) > 2){
+    if(call.data[[3]] > 0)
+      postfix <-paste0("_", call.data[[3]])
+    else
+      postfix <-paste0("_", "all")
+  }
+  title <- paste0(name, postfix)
+  # print(title)
+  return(get_trace(x, idx))
+  # invisible(view_trace(x, idx, title=title))
+}
+
+```
+
+# Plotting
+
+```{r}
+# TODO
+
+trace.env$add_states_areas <- function(plot, states, rooms, min.ts=-1, max.ts=Inf){
+  states.colors <- viridis::magma(length(states), begin=0.8, end=0.3)
+  for(i in 1:length(states)){
+    state <- states[[i]]
+    state.data <- state$ranges
+    state.data$y1 <- rooms[[1]]
+    state.data$y2 <- rooms[[length(rooms)]]
+    state.data <- state.data[start >= min.ts & end <= max.ts,]
+    state.data$name <- as.character(attr(state, "name"))
+    mid.alpha <- 0.2
+    
+    if(i %in% c(1, length(states))){
+      start.end.alpha <- 0.6
+    }
+    s.col <- states.colors[[i]]
+    
+    agents <- state$agents
+    
+    cat("\nPlotting State: ", i, paste(state.data$start, state.data$end, state.data$size, state.data$alpha, sep="-", collapse=", "))
+    cat("\nRooms: ", paste0(rooms, collapse=","))
+    cat("\nAgents: ", paste0(agents, collapse=","), "\n")
+    
+    plot <- plot +
+      geom_rect(data=state.data, aes(xmin = start, xmax = end, ymin = y1, ymax = y2, state=name), fill=s.col, color=s.col, size=0.8, alpha=mid.alpha) +
+      geom_segment(data=state.data, aes(x = start, xend = start, y = y1, yend = y2, state=name), size=0.5, color=s.col, alpha=start.end.alpha, linetype="dashed") +
+      geom_segment(data=state.data, aes(x = end, xend = end, y = y1, yend = y2, state=name), size=0.5, color=s.col, alpha=start.end.alpha, linetype="dashed")
+  }
+  
+  plot <- plot + scale_discrete_manual(name="state", values = states.colors)
+  return(plot)
+}
+
+trace.env$plot_trace_state <- function(program, trace_idx, agents=c(), all.rooms=TRUE){
+  trace <- program$result$traces[[trace_idx]]
+  plot <- ggplot()
+  # if(is.null(agents)){
+  #   agents <- unlist(state$agents)
+  # }
+  # rooms <- c(state$positive.rooms, state$negative.rooms)
+  # if(all.rooms){
+  #   rooms <- attr(program, "room.cols")
+  # }
+  rooms <- attr(program, "room.cols")
+  
+  agents <- c()
+  for(s in program$states){
+    agents <- c(agents, s$agents)
+  }
+  plot <- add_states_areas(plot, program$states, rooms, min(trace$tsID)-1, max(trace$tsID)+1)
+  
+  agents <- unique(agents)
+  rooms <- unique(rooms)
+  agent_data_template <- trace[, c("tsID", "time")]
+  agent_data_template$x1 <- agent_data_template$tsID
+  agent_data_template <- agent_data_template[, x2 := data.table::shift(x1, 1L, type="lag")]
+  
+  agents.colors <- viridis::viridis(length(agents), begin=0.8, end=0.3)
+  for(a in 1:length(agents)){
+    a.color <- agents.colors[[1]]
+    agent_data <- copy(agent_data_template)
+    agent_data$y1 <- rooms_with_agent(trace[, ..rooms], agents[[a]])
+    agent_data$y1 <- ifelse(is.na(agent_data$y1), "NA", agent_data$y1)
+    agent_data <- agent_data[, y2 := data.table::shift(y1, 1L, type="lag")]
+    agent_data$agent <- as.character(agents[[a]])
+    
+    plot <- plot +
+      geom_point(data=agent_data, aes(x=x1, y=y1, color=a.color, group="Agents"), alpha=0.4, size=2.3) +
+      geom_point(data=agent_data, aes(x=x2, y=y2, color=a.color, group="Agents"), alpha=0.4, size=2.3) +
+      geom_segment(data=agent_data, aes(x=x1, xend=x2, y=y1, yend=y2, color=a.color), size=0.7, alpha=0.3)
+  }
+  plot <- plot +
+    # scale_colour_discrete(name="Agents", labels = agents) +
+    scale_y_discrete("Rooms", limits=c(rooms, "NA"), drop=FALSE) +
+    scale_fill_discrete(name="States") + 
+    scale_color_discrete(name="Agents") +
+    labs(x="Time", y="Rooms")
+  return(ggplotly(plot))
+  # return(plot)
+}
+```
+
+```{r}
+
+# plot_trace_state(transitionTestSynth, 2, c("a1", "a2", "a3"), all.rooms=TRUE)
+```
+
+```{r}
+# # dataToPlot <- resFinal1[[1]][, c("tsID", "14", "24")]
+# dataToPlot <- resFinal1[[1]][, c("tsID", "14", "24")]
+# room_cols <- c("14", "24")
+# dataToPlot$time <- new.tripsDT[tsID %in% dataToPlot$tsID,][["time"]]
+# dataToPlot[["a334"]] <- apply(dataToPlot[, ..room_cols], 1, find_room_with_agent, room_cols, "334")
+# dataToPlot[["a432"]] <- apply(dataToPlot[, ..room_cols], 1, find_room_with_agent, room_cols, "432")
+# 
+# # View(dataToPlot)
+# 
+# testPlot <- ggplot() +
+#   geom_point(data=dataToPlot[!is.na(a334),], aes(x = time, y = a334, color="blue"), alpha=0.9, size=0.8) + 
+#   geom_point(data=dataToPlot[!is.na(a432),], aes(x = time, y = a432, color="red"), alpha=0.9, size=0.8) +
+#   scale_colour_discrete(name="Agents", labels = c("Agent 334", "Agent 432")) +
+#   labs(y="Time", x="Rooms")
+# testPlot
+```
+
+# Attach the environment
+
+```{r}
+attach(trace.env) # Simulate a package by attaching this to the search_envs()
+```

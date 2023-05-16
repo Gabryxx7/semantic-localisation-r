@@ -1,0 +1,143 @@
+# Raw RSSI export to regular time series
+
+You'll need these files: 1. `2019Analysis/functions.R`: contains all the filtering functions 2. `export_2019-10-07_14_52_23.csv`: Raw RSSI dataset 3. `Tag_List.csv`: List of tags and their config info 4. `September_2019_Deployment.csv`: List of tags assignment 5. `deployed_devices.csv"`: List of deployed scanner devices (e.g Android phones)
+
+```{r}
+library(utils)
+library(foreach) 
+library(doParallel)
+library(stringr)    # working with strings
+library(lubridate)  # working with dates 
+library(readr)
+library(dplyr)
+library(data.table)
+library(png)
+library(dlm)
+numCores <- (detectCores()-1)
+```
+
+```{r}
+sep2019.filename <<- "export_2019-10-07_14_52_23.csv" #Selecting the trip manually
+sep2019.file <<- file(file.path("./data/original/exports/history/", sep2019.filename), 'r')  # connection for reading
+sep2019.firstLine <<- readLines(sep2019.file, n = 1)
+close(sep2019.file)
+sep2019.firstLine
+```
+
+Read raw data RSSI export:
+
+```{r}
+sep2019 <<- fread(nThread = numCores ,file.path("./data/original/exports/history/", sep2019.filename), sep=",", colClasses=c("imei"="character", "rssi"="numeric", "tx_power"="numeric", "battery"="numeric","timestamp_scan"="numeric", "minor"="numeric"), na.strings="1c58221bc-fa61-46e2-a151-d2c4710527d0", skip = 1)
+sep2019[, tx_power := NULL] #Saving memory
+```
+
+```{r}
+assignID <- function(idData, dataset){
+  rssiIDAssign <- function(counter,x, y){
+    cat(paste(counter, x$Tag, x$From, x$To, x$ID, " (RSSI Data) "))
+    y <- y[minor == x$Tag & is.na(ID) & timestamp %between% c(x$From, x$To), ID := x$ID]
+    cat(" -- Done \n")
+  }
+  tracesIDAssign <- function(counter,x, y){
+    cat(paste(counter, x$Tag, x$From, x$To, x$ID, " (Traces Data) "))
+    y <- y[minor == x$Tag & is.na(ID) & (startTime %between% c(x$From, x$To) | endTime %between% c(x$From, x$To)), ID := x$ID]
+    cat(" -- Done \n")
+  }
+  regularTracesIDAssign <- function(counter,x, y){
+    cat(paste(counter, x$Tag, x$From, x$To, x$ID, " (Something Data) "))
+    y <- y[minor == x$Tag & is.na(ID) & (startTime %between% c(x$From, x$To)), ID := x$ID]
+    cat(" -- Done \n")
+  }
+  dataset <- dataset[, ID := NULL]
+  dataset <- dataset[, ID := as.character()]
+  rows <- nrow(idData)
+  
+  if("timestamp" %in% colnames(dataset)){
+    cat("\nAssigning ID to Raw RSSI dataset \n")
+    idData[, rssiIDAssign(paste0(.I,"/",rows), .SD, dataset), by = 1:rows]
+  }
+  else if("startTime" %in% colnames(dataset) && "endTime" %in% colnames(dataset)){
+    cat("\nAssigning ID to traces dataset \n")
+    idData[, tracesIDAssign(paste0(.I,"/",rows), .SD, dataset), by = 1:rows]
+  }
+  else if("startTime" %in% colnames(dataset)){
+    cat("\nAssigning ID to regularised traces dataset \n")
+    idData[, regularTracesIDAssign(paste0(.I,"/",rows), .SD, dataset), by = 1:rows]
+  }
+  
+  return(dataset)
+}
+```
+
+Get beacons metadata:
+
+```{r}
+gSheet.beacons <<- fread(nThread = numCores, "./data/original/Tag_List.csv")
+gSheet.beacons <<- gSheet.beacons[, `:=`(TagID=as.numeric(TagID), AdvRate=as.numeric(AdvRate), TxPower=as.numeric(TxPower))]
+sep2019.testBatch.beacons <- gSheet.beacons[stringr::str_detect(Position, 'Test Batch')] #Getting the test minors
+
+gSheet.deployment <<- fread(nThread = numCores, "./data/original/September_2019_Deployment.csv")
+gSheet.deployment$From <- as.POSIXct(gSheet.deployment$From, tz="Australia/Melbourne", origin = "1970-01-01",  format = "%d/%m/%Y %H:%M", optional=TRUE)
+gSheet.deployment$To <- as.POSIXct(gSheet.deployment$To, tz="Australia/Melbourne", origin = "1970-01-01",  format = "%d/%m/%Y %H:%M", optional=TRUE)
+gSheet.deployment[is.na(From), From := sep2019.timeRange$minTime][is.na(To), To := sep2019.timeRange$maxTime]
+gSheet.deployment[, Tag := as.numeric(Tag)]
+gSheet.deployment[,Total := (To-From)] #If beacon 1 is assigned in the ranges 1-6 and 2-3
+gSheet.deployment <- gSheet.deployment[order(Total)] #If beacon 1 is assigned in the ranges 1-6 and 2-3
+
+sep2019.nurse.beacons <- gSheet.deployment[stringr::str_detect(Role2, 'urse')] #Nurses
+sep2019.patients.beacons <- gSheet.deployment[stringr::str_detect(Role2, 'atient')] #Patients
+sep2019.staff.beacons <- gSheet.deployment[Role2 %in% c("PSA", "Theatre Tech", "Head Theatre Tech")] #Patients
+```
+
+Get devices' data:
+
+```{r}
+devices <<- fread(nThread = numCores, "./data/original/deployed_devices.csv", colClasses = c("id"="character", "nroom"="integer"))
+devices[, `:=`(room=paste(nroom, roomShort, sep="-"), roomChar=roomCharLong)]
+devicesLetters <- c("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z")
+devices[, roomChar := devicesLetters[.I] ]
+```
+
+Assign ID from deployment sheet
+
+```{r}
+sep2019 <- assignID(gSheet.deployment, sep2019)
+sep2019.filtered <- sep2019[!is.na(ID)]
+```
+
+Apply the median filter to smooth traces:
+
+```{r}
+sep2019.smoothed15 <- filterMedianMaximumRssiDT(dt=sep2019.filtered, timeWindow = 15, selectMaximum = TRUE, intervalPerMinor = FALSE, preKalman=FALSE, useRssiPacketScoring = TRUE)
+sep2019.smoothed15 <- merge(x=sep2019.smoothed15, y=devices[,c("id", "room")], by.x="imei", by.y="id")
+assignID(gSheet.deployment, sep2019.smoothed15)
+sep2019.smoothed15 <- sep2019.smoothed15[order(from)]
+```
+
+Generate traces:
+
+```{r}
+sep2019.traces15 <- generateTrips(filteredRecords = sep2019.smoothed15, timeBeforeLosingTrack = 300, rssiThreshold = -99, connectSameRooms = TRUE, connectDifferentRooms = FALSE, tripPointsThreshold = 2, usePointsThreshold = TRUE, nThread = 1)
+
+```
+
+Regularise time series:
+
+```{r}
+timeRegularSeries <- data.frame(startTime=seq(min(sep2019.traces15$startTime), max(sep2019.traces15$endTime), by=10))
+timeRegularSeries$endTime <- append(timeRegularSeries$startTime[-1], timeRegularSeries$startTime[length(timeRegularSeries$startTime)]+10)
+sep2019.traces15.regular <- generateRegularTimeSeries(keepLastRoomOnLost = FALSE, data=sep2019.traces15, timeRegularSeries=timeRegularSeries, devices = devices, minors=unique(sep2019.traces15$minor), timeBreaks=10)
+```
+
+Make sure column types are correct:
+
+```{r}
+tz(sep2019.traces15$startTime) <- "Australia/Melbourne"
+tz(sep2019.traces15$endTime) <- "Australia/Melbourne"
+setDT(sep2019.traces15)
+assignID(gSheet.deployment, sep2019.traces15)
+sep2019.traces15 <- sep2019.traces15[order(startTime)]
+sep2019.traces15 <- merge(sep2019.traces15, devices[,c("nroom", "room")],by.x="startRoom", by.y="nroom")
+sep2019.traces15.timeRange <- sep2019.traces15[, .(min=min(startTime), max=max(endTime)), by=room]
+sep2019.traces15.timeRange[, diff:=as.numeric(difftime(max,min, units="secs"))]
+```

@@ -1,0 +1,145 @@
+```{r}
+roomsHeight <- 0.8
+roomsMap <- list(r0=list(prefix="", sym=""),
+                 r4=list(prefix="Room", sym="T"),
+                 r3=list(prefix="Room", sym="S"),
+                 r2=list(prefix="Room", sym="R"),
+                 r1=list(prefix="Room", sym="Q"))
+rooms.colors <- viridis::viridis(length(roomsMap), begin=0.8, end=0.3, alpha=0.8)
+barplot(1:length(rooms.colors), col=rooms.colors)
+for(i in 1:length(roomsMap)){
+  pos <- i
+  roomsMap[[i]][["name"]] <- paste0(roomsMap[[i]]$prefix, " ", roomsMap[[i]]$sym)
+  roomsMap[[i]][["pos"]] <- i
+  roomsMap[[i]][["ymin"]] <- as.double(i-(roomsHeight/2))
+  roomsMap[[i]][["ymax"]] <- as.double(i+(roomsHeight/2))
+  roomsMap[[i]][["color"]] <- rooms.colors[[i]]
+}
+roomsPos <- unlist(unname(lapply(roomsMap, function(x) x$pos)))
+roomsLabels <- unlist(unname(lapply(roomsMap, function(x) x$name)))
+
+timeData <- list(c("r1", 0, 3),
+                 c("r2", 3, 4),
+                 c("r3", 4, 6),
+                 c("r2", 6, 8),
+                 c("r3", 9, 10),
+                 c("r4", 10, 12),
+                 c("r3", 12, 13),
+                 c("r1", 14, 15))
+
+start <- as.numeric(unlist(lapply(timeData, `[`, 2)))
+end <- as.numeric(unlist(lapply(timeData, `[`, 3)))
+totalLength <- max(c(start,end))
+totalBreaks <- seq(1,totalLength)
+roomsData <- lapply(timeData, function(x) {
+  return(c(ymin=roomsMap[[x[1]]]$ymin, ymax=roomsMap[[x[1]]]$ymax, color=roomsMap[[x[1]]]$color, sym=roomsMap[[x[1]]]$sym))
+})
+
+roomsPlotData <- as.data.table(list(room=unlist(lapply(timeData, `[`, 1)),
+                                    xmin=start,
+                                    xmax=end,
+                                    duration=start-end,
+                                    ymin=as.double(unlist(lapply(roomsData, `[`, "ymin"))),
+                                    ymax=as.double(unlist(lapply(roomsData, `[`, "ymax"))),
+                                    color=unlist(lapply(roomsData, `[`, "color")),
+                                    sym=unlist(lapply(roomsData, `[`, "sym"))))
+roomsRect <- lapply(roomsMap, function(x){
+    x[["xmin"]] <- as.numeric(0)
+    x[["xmax"]] <- as.numeric(totalLength)
+    return(unlist(x))
+})
+roomsRect <- as.data.table(do.call(rbind, roomsRect))
+roomsRect$ymin <- as.double(roomsRect$ymin)
+roomsRect$ymax <- as.double(roomsRect$ymax)
+roomsRect$xmin <- as.double(roomsRect$xmin)
+roomsRect$xmax <- as.double(roomsRect$xmax)
+
+summaryRoomPlotData <- as.data.table(list(room=roomsPlotData$room,
+                                          xmin=roomsPlotData$xmin,
+                                          xmax=roomsPlotData$xmax,
+                                          duration=roomsPlotData$duration,
+                                          ymin=roomsMap[[1]]$ymin,
+                                          ymax=roomsMap[[1]]$ymax,
+                                          color=roomsPlotData$color,
+                                          sym=roomsPlotData$sym))
+expanded <- summaryRoomPlotData[rep(1:nrow(summaryRoomPlotData), roomsPlotData$xmax-roomsPlotData$xmin)]
+expanded$xmin <- unlist(apply(summaryRoomPlotData, 1, function(x) x[["xmin"]]:(as.integer(x[["xmax"]])-1)))
+expanded$xmax <- expanded$xmin+1
+lines <- as.data.table(list(x=totalBreaks,
+                            y1=min(roomsPos)-0.75,
+                            y2=max(roomsPos)+0.75))
+# xTicks <- unlist(lapply(totalBreaks, function(x) bquote(t[.(ceiling(x))])))
+xTicks <- unlist(lapply(totalBreaks, function(x) bquote(.(paste0("t<sub>",ceiling(x), "</sub>")))))
+names(xTicks) <- totalBreaks
+roomsPlot <- ggplot() +
+      geom_rect(data=roomsPlotData, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill=room)) +
+      geom_rect(data=expanded, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill=room)) +
+      geom_text(data=expanded, aes(x=xmin+(xmax-xmin)/2, y=ymin+(ymax-ymin)/2, label=sym), size=7, color="#444444") +
+      geom_segment(data=lines, aes(x=x, xend=x, y=y1, yend=y2), linewidth=0.4, color="#aaaaaa", linetype="dashed") +
+      geom_rect(data=roomsRect,aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax), fill=NA, color="#aaaaaa") +
+      scale_y_discrete("Rooms", limits=c(roomsLabels)) +
+      scale_colour_manual(values = rooms.colors) +
+      scale_fill_manual(values = rooms.colors) +
+      scale_x_continuous(breaks=totalBreaks-0.5, labels = xTicks) +
+      theme_classic() +
+      theme(line = element_blank(), title = element_blank(), text = element_text(size = 34), legend.position = "none", axis.text.x = element_markdown())
+ggsave(file="plots/roomsPlot.pdf", plot=roomsPlot, width=18, height=4, dpi=300)
+roomsPlot
+```
+```{r}
+ggsave(file="plots/roomsPlot.pdf", plot=roomsPlot, width=18, height=4, dpi=300)
+```
+
+# 3D time plot
+```{r}
+# t_to_plot <- randTrace1000
+# t_cols <- colnames(t_to_plot)[3:ncol(t_to_plot)-1]
+n_points <- 1000
+start_time <- 30000
+t_to_plot <- new.tripsDT[start_time:(start_time+n_points),]
+t_cols <- colnames(t_to_plot)[4:(ncol(t_to_plot)-3)]
+
+for(c in t_cols){
+  t_to_plot[1][[c]] <- t_to_plot[1][["11"]]
+  t_to_plot[nrow(t_to_plot)][[c]] <- t_to_plot[1][["11"]]
+}
+
+t_res <- start_trace(t_to_plot) %>%
+  add_state(a(set()), r(set(.any))) %~~>%
+  end_trace()
+
+occ_threshold <- 0.2
+occupancy <- attr(t_res, "occupancy")
+occ_rooms <- data.table("occ"=unlist(occupancy), "room"=names(occupancy))
+occ_rooms <- occ_rooms[order(occ_rooms, decreasing=TRUE)]
+occ_rooms <- occ_rooms[occ > occ_threshold]
+t_cols <- t_cols[t_cols %in% occ_rooms$room]
+occ_3d <- apply(t_to_plot[, ..t_cols], 2, function(x) lapply(x,length))
+occ_3d_dt <- data.table(apply(do.call("cbind", occ_3d), 2, unlist))
+occ_3d_dt_melted <- melt(occ_3d_dt, variable.name="room", value.name="occ")
+occ_3d_dt_melted$ts <- rep(seq(nrow(occ_3d_dt), 1, -1),ncol(occ_3d_dt))
+
+
+# p2 <- plot_ly() %>% 
+#   add_trace(x = occ_3d_dt_melted$ts, y = occ_3d_dt_melted$occ, mode = "lines", fill = "tozeroy", yaxis = "y2", name = "Density") %>% 
+#   layout(yaxis2 = list(overlaying = "y", side = "right"))
+# p2
+p3 <- plot_ly(occ_3d_dt_melted, x = ~ts, y = ~room, z = ~occ, split = ~room, surfaceaxis=2, type = 'scatter3d', opacity=0.5,
+              line = list(shape = 'spline'))
+p3
+
+
+```
+```{r}
+mat <- sapply(-10:10, function(mean) dnorm(seq(-20,20,len=210), mean))+
+        sapply(rep(0,21), function(mean) dnorm(seq(-20,20,len=210), mean))
+matplot(seq(-20,20,len=210), mat, type="n", ylim=c(0,1.5))
+matlines(seq(-20,20,len=210), mat+rep( seq(0,1, len=21), each=210), lty=1,col=1)
+
+# 
+# occ_3d_mat <- as.matrix(do.call("cbind",occ_3d))
+# t_range <- seq(1,nrow(occ_3d_mat))
+# matplot(t_range, occ_3d_mat, type="n", ylim=c(0,1.5))
+# matlines(t_range, occ_3d_mat, lty=1,col=1)
+```
+

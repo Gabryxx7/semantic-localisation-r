@@ -1,0 +1,280 @@
+# Parsers
+## Agents Parser
+```{r}
+get_agents <- function(agents_str, debug=FALSE){
+  match_set <- function(set_str, program){
+    # {*([\w\d\s]+(?!\W\D\S)*)}*
+    matched_identifiers = unlist(str_match_all(set_str, "[\\w\\d]+"))
+    # cat(sep="","Matched set: ", paste0(matched_identifiers), "\n")
+    if(length(matched_identifiers) > 0)
+      program$sets <- append(program$sets, list(matched_identifiers))
+    return(program)
+  }
+  
+  match_range <- function(set_str, program){
+    # {*([\w\d\s]+(?!\W\D\S)*)}*
+    matched_identifiers = unlist(str_match_all(set_str, "[\\w\\d]+"))
+    # cat(sep="","Matched range: ", paste0(matched_identifiers), "\n")
+    if(length(matched_identifiers) > 0)
+      program$ranges <- append(program$ranges, list(matched_identifiers))
+    return(program)
+  }
+  
+  match_group <- function(set_str, program){
+    # {*([\w\d\s]+(?!\W\D\S)*)}*
+    matched_identifiers = unlist(str_match_all(set_str, "[\\w\\d]+"))
+    # cat(sep="","Matched range: ", paste0(matched_identifiers), "\n")
+    if(length(matched_identifiers) > 0)
+      program$groups <- append(program$groups, list(matched_identifiers))
+    return(program)
+  }
+
+  enclosingPossible <- TRUE
+  set_brkts <- list(name="sets", open="{", close="}", fun=match_set)
+  group_brkts <- list(name="groups", open="[", close="]", fun=match_group)
+  range_brkts <- list(name="ranges", open="(", close=")", fun=match_range)
+  brackets <- list(sets=set_brkts, groups=group_brkts, ranges=range_brkts)
+  brk_stack <- list()
+  
+  plus <- list(name="add", char="+", fun="select_agents")
+  minus <- list(name="remove", char="-", fun="remove_agents")
+  signs <- list(plus=plus, minus=minus)
+  
+  special_chars <- c(unlist(lapply(brackets, function(x) c(x$open, x$close)), use.names=FALSE),
+                        unlist(lapply(signs, function(x) c(x$char)), use.names=FALSE))
+  
+  str_list = str_split(agents_str,boundary("character"))[[1]]
+  if(debug) cat(sep="","Split list: ", str_list, "\n")
+  strlen <- length(str_list)
+  
+  data <- list(sets=list(), groups=list(), ranges=list())
+  i = 0
+  while(i <= strlen){
+    i = i + 1
+    char <- str_list[i]
+    if(!(char %in% special_chars)){
+      next
+    }
+    last_brk <- NULL
+    if(debug) cat(sep="","Chars[", i, "] = '", char,"'\t\tSTACK: ", paste(brk_stack), "\n")
+    if(length(brk_stack) > 0){
+      last_brk <- brk_stack[length(brk_stack)][[1]]
+    }
+    matched <- FALSE
+    for(sign in signs){
+      if(char == sign$char){
+        matched <- TRUE
+        break
+      } 
+    }
+    if(matched)
+      next
+    for(brk in brackets){
+      # cat(sep="","Bracket type: ", brk$name, brk$open, brk$close, "\n")
+      if(char == brk$close){
+        # cat(sep="","Char", char, "is", brk$close, "\n")
+        if(is.null(last_brk)){
+          stop(paste0("Error: Closing unopened bracket '", char, "' at index ", i))
+        }
+        if(last_brk[1] != brk$open){
+          stop(paste0("Error: Found unclosed bracket at index ", i, ". Last bracket '", last_brk[1], "' opened at index ", last_brk[2]))
+        }
+        data <- brk$fun(substr(agents_str, last_brk[2], i), data)
+        # matched <- c("test")
+        if(debug) cat(sep="","Closing ", brk$close, " ", brk$name," at ", i, ", opened at ", last_brk[2], ": ", substr(agents_str, last_brk[2], i),"\tMatched ", brk$name, "\n")
+        brk_stack <- head(brk_stack, -1)
+        # append(sets, match_set(substr(agents_str, last_brk[2], i)))
+        matched <- TRUE
+        break
+      }
+      else if(char == brk$open){
+        if(length(brk_stack) > 0 && !enclosingPossible){
+          stop(paste0("Error: Enclosure not supported. Found unclosed bracket at index ", i, ". Last bracket '", last_brk[1], "' opened at index ", last_brk[2]))
+        }
+        brk_stack <- append(brk_stack, list(c(char, i)))
+        if(debug) cat(sep="","Opening ", brk$open, " ", brk$name," at ", i, "\n")
+        matched <- TRUE
+        break
+      }
+    }
+  }
+  if(length(brk_stack) > 0){
+    last_brk <- brk_stack[length(brk_stack)][[1]]
+    stop(paste0("Error: Found unclosed bracket. Last bracket '", last_brk[1], "' opened at index ", last_brk[2]))
+  }
+  cat(sep="","Matched: \n")
+  for(i in 1:length(data)){
+    type_name <- names(data)[[i]]
+    cat(sep="",type_name, ":\t")
+    lapply(data[[i]], function(x) cat(sep="",brackets[[type_name]]$open, paste(x, collapse=","),brackets[[type_name]]$close, "  "))
+    cat("\n")
+  }
+}
+get_agents("{540,532,400[]}, {999,888,777} [123,231,321]", debug=FALSE)
+```
+
+## Rooms Parser
+
+## Time Parser
+
+## State Paraser
+
+## Program Parser
+
+
+# Operators override TESTING
+Sources:
+- https://stackoverflow.com/questions/63431350/can-you-create-an-r-function-that-calls-using-a-prefix-and-suffix-operating-lik
+- https://www.rdocumentation.org/packages/rlang/versions/0.1/topics/quosure
+- https://adv-r.hadley.nz/quasiquotation.html#substitution
+- https://adv-r.hadley.nz/functions.html#prefix-transform
+```{r eval=FALSE}
+
+test.fun <- function(.prev, new="new", modified=""){
+  cat(.prev, new, modified)
+}
+# Overriding piping operator
+`%|->%` <- function(lhs, rhs) {
+  call <- match.call()
+  call[[1]] <- quote(`%>%`)
+  call[[3]][["modified"]] <- "MODIFIED_YO"
+  x <- eval.parent(call)
+}
+
+a <- function(...){
+  tmp.env <- new.env(parent=globalenv())
+  def_group <- function(...){
+    ret <- enexprs(...)
+    attr(ret, "class") <- "trace.test"
+    attr(ret, "type") <- "group"
+    return(ret)
+  }
+  def_set <- function(...){
+    ret <- enexprs(...)
+    attr(ret, "class") <- "trace.test"
+    attr(ret, "type") <- "set"
+    return(ret)
+  }
+  def_range <- function(...){
+    ret <- enexprs(...)
+    attr(ret, "class") <- "trace.test"
+    attr(ret, "type") <- "range"
+    return(ret)
+  }
+  tmp.env[["group"]] <- function(...) return(def_group(...))
+  tmp.env[["range"]] <- function(...) return(def_range(...))
+  # tmp.env[["(.trace.def"]] <- function(...) return(def_group(...))
+  # tmp.env[["{.trace.def"]] <- function(...) return(def_set(...))
+  # tmp.env[[".["]] <- function(...){
+  #   return(def_group(...))
+  # }
+  tmp.env[["!"]] <- function(x){
+    attr(x, "not") <- TRUE
+    return(x)
+  }
+  tmp.env[["~"]] <- function(x){
+    attr(x, "exclude") <- TRUE
+    return(x)
+  }
+  tmp.env[["."]] <- function(...){
+    ret <- c(...)
+    attr(ret, "class") <- "test"
+    return(ret)
+  }
+
+  tmp.env[["("]] <- function(...){
+    ret <- c(enexprs(...))
+    if(length(ret) <= 0){
+      return(ret)
+    }
+    if(is.null(attr(ret[1], "class"))){
+      attr(ret, "class") <- "test"
+      attr(ret, "type") <- "set"
+      return(ret)
+    }
+    if(attr(ret[1], "type") == "set"){
+      attr(ret, "type") <- "group"
+    }
+    return(ret)
+  }
+  pre <- enexprs(...)
+  post <- lapply(pre, eval, envir=tmp.env)
+  return(post)
+}
+
+s <- function(...){
+
+  `%->%` <- function(x, y){
+    if(all(c(attr(x, "class"), attr(y, "class")) == "trace.test"))
+    return(list(from=x, to=y))
+  }
+  `%~>%` <- function(x, y){
+    if(all(c(attr(x, "class"), attr(y, "class")) == "trace.test"))
+    return(list(from=x, to=y))
+  }
+  x <- c(eval(...))
+  attr(x, "class") <- "trace.trans.test"
+  return(x)
+}
+
+```
+```{r}
+test_fun <- function(...){
+  REGEX <- list(expand="\\.\\.\\(*([\\w\\d]+)\\)*")
+  apply_regexes <- function(x){
+    cat("Applying regex on: (",length(x), ")")
+    for(rx in REGEX){
+      for(s in list(x)){
+        cat("\n- ", paste0(s))
+        matches <- str_match_all(paste(s),rx)[[1]]
+        if(nrow(matches) > 0){
+          print(matches)
+          return(matches)
+        }
+      }
+      return(x)
+    }
+    return(c())
+  }
+  expand_var <- function(...){
+    return(eval(...))
+  }
+  eval_expr <- function(x){
+    tryCatch({
+      cat("\nevaluating ", paste(x))
+      # to_expand <- apply_regexes(x)
+      evaluated <- eval(x)
+      cat(" = ", paste0(evaluated))
+      return(evaluated)
+    }, error= function(e){
+      print(e)
+      return(x)
+    })
+  }
+  args <- enexprs(...)
+  args2 <- lapply(args, eval_expr)
+  return(list(pre=args, post=args2))
+}
+
+# 
+# .. <- structure(list(NULL), class="Trace.Op")
+# `[.Trace.Op` <- function(a, x) paste0("range", x)
+# 
+# `.(` <- function(a, x) paste0("group", x)
+# 
+# `{.Trace.Op` <- function(a, x) paste0("set", x)
+
+# `[.Trace` <- function(x,i=NULL,j=NULL) {
+#   message("First parameter is ", i, "\n")
+#   message("Second parameter is ", j, "\n")
+#     sum(x)
+# }
+
+# 
+# `[.myclass` <- function(x,i=NULL,j=NULL) {
+#   message("First parameter is ", i, "\n")
+#   message("Second parameter is ", j, "\n")
+#     sum(x)
+# }
+# obj[c(1,2,3)]
+```

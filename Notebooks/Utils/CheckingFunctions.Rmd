@@ -1,0 +1,146 @@
+# Basic Checking Functions
+## Cpp implementation
+```{r}
+sourceCpp("Notebooks/Utils/checking_functions.cpp")
+```
+
+## R implementation 
+### Sets
+
+```{r}
+trace.env$check_set <- function(agent_set, agents_in_room){
+  if("not" %in% attr(agent_set, "modifiers")){ 
+    if(is.null(agent_set) || length(agent_set) <= 0)
+      return(TRUE)
+    res <- !any(agent_set %in% agents_in_room)
+    prefix <- trace.env$OP$negation
+  }
+  else{
+    if(is.null(agent_set) || length(agent_set) > length(agents_in_room))
+      return(FALSE)
+    prefix <- ""
+    res <- all(agent_set %in% agents_in_room)
+  }
+  # cat("\nCheck Sets: ", prefix,paste0(agent_set, collapse=","), "\t", paste0(agents_in_room, collapse=","), "\t", paste0(res, collapse=","))
+  return(res)
+}
+
+trace.env$check_sets <- function(agent_set_list, agents_in_room){
+  if(is.null(agent_set_list) || length(agent_set_list) <= 0){
+    return(TRUE)
+  }
+  sets_res <- unlist(lapply(agent_set_list, check_set, agents_in_room))
+  return(all(sets_res == TRUE))
+}
+```
+
+### Groups
+
+```{r}
+trace.env$check_group <- function(agent_group, agents_in_room){
+  if(is.null(agent_group))
+    return(TRUE)
+  return(any(agent_group %in% agents_in_room))
+}
+
+trace.env$check_groups <- function(agent_group_list, agents_in_room){
+  if(is.null(agent_group_list) || length(agent_group_list) <= 0){
+    return(TRUE)
+  }
+  groups_res <- unlist(lapply(agent_group_list, check_group, agents_in_room))
+  return(all(groups_res == TRUE))
+}
+```
+
+### Range
+
+```{r}
+trace.env$check_range <- function(agentsList, min=-Inf, max=Inf){
+  total <- length(agentsList)
+  if(is.null(min)){
+    min = -Inf
+  }
+  
+  if(is.null(max)){
+    max = Inf
+  }
+  
+  return(min <= total & total <= max)
+}
+```
+
+
+## Vertical and Horizontal checks
+
+### Indivdual Cells
+
+Given the program data, we want to now fetch all the data related to the
+info we have:
+
+1.  Apply the size range (No point in checking the rest if the cell is
+    outside of the range)
+
+2.  Apply the sets selection (if one of the agents in the set is not
+    there we can stop here)
+
+3.  Apply the group selection
+
+We need a function to find the unique ids in a room (which will just be
+the cell if we are NOT using strings). We then need a way to count these
+ids in case we have a range to check.
+
+```{r}
+## Get unique cells in a room
+trace.env$unique_ids <- function(room_data){
+  if(is.null(room_data)) return(c())
+  if(is.list(room_data) || is.vector(room_data)){
+    return(unlist(room_data))
+  }
+  separator <- ","
+  return(unique(unlist(strsplit(unique(room_data), separator))))
+}
+
+## Get the total number of agents in the room 
+trace.env$total_ids <- function(room_data){
+  ids_list <- unique_ids(room_data)
+  total <- length(ids_list)
+  return(total)
+}
+
+```
+
+The function `check_cell(room_data, set, min, max)` will return `TRUE`
+only if the cell meets all the criteria so only if:
+
+-   The number of agents in the room is between the minimum and the
+    maximum range
+
+-   ANY agents in the set are included in the room data
+
+    -   Negative: Result for the cell should be NEGATED, since the check
+        is done done on a positive presence basis. The agent should NOT
+        be in the room
+
+-   ALL of the agents in the group are included in the room data We can
+    then apply this to the whole room's column:
+
+```{r}
+trace.env$check_cell <- function(room_data, sets, groups, range, debug=FALSE){
+  in_range <- TRUE
+  all_in_room <- TRUE
+  at_least_one <- TRUE
+  
+  ids_list <- unique_ids(room_data)
+  if(length(range) > 0) in_range <- check_range(ids_list, range[[1]], range[[2]])
+  if(length(sets) > 0) all_in_room <- check_sets(sets, ids_list)
+  if(length(groups) > 0) at_least_one <- check_groups(groups, ids_list)
+  if(debug){
+    cat("\nIn room: ", paste0(ids_list, collapse=","), sep="")
+    cat("\nSets: ", paste0(sets, collapse=","), "\t", all_in_room, sep="")
+    cat("\nGroups: ", paste0(groups, collapse=","), "\t", at_least_one, sep="")
+    cat("\nRange: ", paste0(range, collapse=","), "\t", in_range, sep="")
+    cat("\n")
+  }
+  return(in_range & all_in_room & at_least_one)
+}
+```

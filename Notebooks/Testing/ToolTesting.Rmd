@@ -1,0 +1,264 @@
+---
+title: "Tool"
+output: html_notebook
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+# First step: Read the dataset and transform it into a data.table
+
+```{r}
+library(dplyr)
+library(data.table)
+library(rmdHelpers)
+library(utils)
+library(foreach) 
+library(doParallel)
+library(stringr)    # working with strings
+library(lubridate)  # working with dates 
+library(readr)
+library(dlm)
+numCores <- (detectCores()-1)
+```
+
+```{r}
+setwd("/Users/marinig/Documents/GitHub/localization_toolkit/R_Tool")
+load("data/sep2019.traces15.regular.RData")
+load("data/devices.RData")
+sourceCpp('tool_functions.cpp')
+```
+
+Set up the new dataset: (Remember to use `<<-` to assign new.tripsDT in
+the global environment so that the `combine_datasets` function can
+access and manipulate it)
+
+Populate the new dataset from the regularised trips:
+
+```{r}
+asString <- FALSE
+
+beaconsData <- sep2019.traces15.regular$data
+timeSeries <- sep2019.traces15.regular$timeSeries[["startTime"]]
+roomNames <<- sort(devices[nroom > 0]$nroom)
+beaconsInDataset <- unlist(lapply(beaconsData, function(x) x$minor[1]))
+
+new.tripsDT <<- build_trace_dataset(timeSeries, roomNames)
+# Combines each individual beacon's dataset into one large dataset, the result is saved into `new.tripsDt`
+invisible(lapply(beaconsData, combine_datasets, new.tripsDT, beaconsList = beaconsInDataset, asString=asString)) # asString=FALSE to have each cell as a vector instead of a string
+
+## Clean the strings in case asString == TRUE
+if(asString){
+  for (j in colnames(new.tripsDT)[-1]) set(new.tripsDT, j = j, value = substring(new.tripsDT[[j]], 2))
+}
+
+# adding a new column called timeSlotID but I want it to be in front, so I'm saving the previous columns order and then adding it in front when reordering
+prevColNames <- colnames(new.tripsDT)
+new.tripsDT[, timeSlotID := .I]
+setcolorder(new.tripsDT, c("timeSlotID", prevColNames))
+```
+
+Just testing that the cells are ACTUALLY vectors
+
+```{r}
+new.tripsDT[,"14"][[1]][[1]]
+```
+
+# Second step: Query testing
+
+## Run simple query
+
+Let's run a simple query just to make sure the data structure makes
+sense:
+
+```{r}
+vectorized_contains <- function(vector, element){
+  return(element %in% vector)
+}
+sample  <- new.tripsDT[1:100000]
+cat(sample[['33']][[1]]) # Test
+# Right away we can see that beacon 334 moves from room 14 to room 24 at time slots 20 and 22, let's try to capture that
+sampleFromRoom <- "14"
+sampleToRoom <- "24"
+sampleBeacon <- "334"
+sampleResultFrom <- mapply(vectorized_contains, sample[[sampleFromRoom]], sampleBeacon)
+sampleResultTo <- mapply(vectorized_contains, sample[[sampleToRoom]], sampleBeacon)
+sampleResult <- sample[sampleResultFrom | sampleResultTo]
+sampleResult
+
+```
+
+## Find jumps
+
+Let's look for the jumps in time. We calculated the difference between
+the timeSlotID of the current row and the previous one by using shift
+with type='lag'
+
+```{r}
+## Let's look for the jumps
+totalJumps <- sampleResult[ , diff := timeSlotID - shift(timeSlotID, 1L, type="lag")]
+totalJumps[diff > 1] # This should return 0 as new.tripsDT contains ALL the time slots.
+```
+
+Now let's have a look at the jumps in the "from" room. We can also
+search for the timeSlotID before the jump by using the lookahead shift
+`shift(colName, 1L, type="lead")` We can see that there is one jump,
+beacon 334 appears in room
+
+```{r}
+cols <- c('timeSlotID', 'time', 'diff', sampleFromRoom, sampleToRoom)
+sampleTotalFromJumps <- sample[sampleResultFrom, diff := timeSlotID - shift(timeSlotID, 1L, type="lag")]
+sampleTotalFromJumps[diff > 1 | shift(diff, 1L, type="lead") > 1, ..cols]
+```
+
+```{r}
+cols <- c('timeSlotID', 'time', 'diff', sampleFromRoom, sampleToRoom)
+sampleTotalToJumps <- sample[sampleResultTo , diff := timeSlotID - shift(timeSlotID, 1L, type="lag")]
+sampleTotalToJumps[diff > 1 | shift(diff, 1L, type="lead") > 1, ..cols]
+```
+
+Finally, let's have a look at all the jumps the beacon made between the
+two rooms. We can see that beacon 334 moved between room 14 and 24 a
+total of 3 times:
+
+1.  Between tID 20 and 22
+
+2.  Between tID 8636 and 8641
+
+3.  Between tID 8642 and 8644
+
+```{r}
+cols <- c('timeSlotID', 'time', 'diff', sampleFromRoom, sampleToRoom)
+sampleTotalJumps <- sampleResult[ , diff := timeSlotID - shift(timeSlotID, 1L, type="lag")]
+sampleTotalJumps[diff > 1 | shift(diff, 1L, type="lead") > 1, ..cols]
+```
+
+## Extract jumps data
+
+Let's investigate further. Let's extract those jumps from the full
+data.table and see what's happening
+
+```{r}
+jumpRowFrom <- 20
+jumpRowTo <- 22
+padding <- 2
+jump1 <- new.tripsDT[timeSlotID >= jumpRowFrom-padding & timeSlotID <= jumpRowTo+padding]
+jump1
+```
+
+### Filter columns
+
+Let's filter the columns to only get the time-related ones. This will
+only return TRUE for the three columns we listed
+
+```{r}
+colnames(jump1) %in% c('timeSlotID', 'time', 'diff')
+```
+
+This will return True only for the columns where at least one row
+contains the beacon's ID
+
+```{r}
+sapply(jump1, function(x) any(x %like% sampleBeacon))
+```
+
+Now we just need to OR them and get TRUE for both the 3 columns we want
+and the ones where the beacon appears
+
+```{r}
+jump1 <- jump1[, colnames(jump1) %in% c('timeSlotID', 'time', 'diff') | sapply(jump1, function(x) any(x %like% sampleBeacon)), with=F]
+print(colnames(jump1))
+jump1
+```
+
+## Check the other jumps
+
+Let's do the same for the other two jumps:
+
+```{r}
+jumpRowFrom <- 8636
+jumpRowTo <- 8641
+padding <- 2
+jump2 <- new.tripsDT[timeSlotID >= jumpRowFrom-padding & timeSlotID <= jumpRowTo+padding]
+jump2 <- jump2[, colnames(jump2) %in% c('timeSlotID', 'time', 'diff') | sapply(jump2, function(x) any(x %like% sampleBeacon)), with=F]
+print(colnames(jump2))
+jump2
+```
+
+```{r}
+jumpRowFrom <- 8642
+jumpRowTo <- 8644
+padding <- 2
+jump3 <- new.tripsDT[timeSlotID >= jumpRowFrom-padding & timeSlotID <= jumpRowTo+padding]
+jump3 <- jump3[, colnames(jump3) %in% c('timeSlotID', 'time', 'diff') | sapply(jump3, function(x) any(x %like% sampleBeacon)), with=F]
+print(colnames(jump3))
+jump3
+```
+
+## Agents Selection Testing
+
+We can run some testing for the previous example. We know beacon 334
+moved from room 14 at t=20 and came back at some point around t=8641
+
+```{r}
+checkedCol <- check_room_series(sample[["14"]], "334")
+cat("How many time slots was 334 in the room 14?: ", length(which(checkedCol == TRUE)), "\n\n")
+cat("How many time slots was 334 NOT in the room 14?: ", length(which(checkedCol == FALSE)), "\n\n")
+```
+
+Let's try with some range testing
+
+```{r}
+total_in_room <- lapply(sample[["14"]], total_ids)
+sample_min5 <- which(total_in_room > 5)
+sample_max1 <- which(total_in_room < 1)
+cat("\n", length(sample_min5), "Time slots with > 5 people:\n", paste0(sample_min5))
+cat("\n\n", length(sample_max1), "Time slots with < 1 people (empty):\n", paste0(sample_max1))
+```
+
+We can also see what agents 334 was with at any point in time, a list of
+their encounters:
+
+```{r}
+unique_ids_in_room <- lapply(sample[["14"]], unique_ids)
+unique_combinations <- unique(unique_ids_in_room) # Getting the unique combinations of IDs
+which(unique_combinations %in% "334") # This does not work as it will only get the combination which is exactly "334"
+# We need to run lapply to check each list in the list
+idx_with_334 <- which(lapply(unique_combinations, function(x) "334" %in% x) == TRUE)
+invisible(lapply(unique_combinations[idx_with_334], function(x) cat(x, "\n\n")))
+```
+
+Finally, we can now try to combine all together to get ranges and sets.
+Let's get all the time slots where 334 was in room 14 with at least 0
+and at most 1 person. So they should be alone
+
+```{r}
+cols <- c('timeSlotID', 'time', 'diff', "14")
+checkedCol334Alone <- check_room_series(sample[["14"]], "334", 0, 1)
+sample[(checkedCol334Alone), ..cols]
+```
+
+PERFECT!! Now one more time but with at most 2 people:
+
+```{r}
+cols <- c('timeSlotID', 'time', 'diff', "14")
+checkedCol334 <- check_room_series(sample[["14"]], "334", 0, 2)
+sample[checkedCol334, ..cols]
+```
+
+Technically that should mean that if we take the previous indexes, we
+should be able to get the times where 334 was alone (again):
+
+```{r}
+intersection <- unlist(checkedCol334) & unlist(checkedCol334Alone)
+sample[intersection, ..cols]
+cat(length(checkedCol334Alone), " vs ", length(intersection))
+```
+
+
+# Synthetic Tests
+```{r}
+generate_
+```
+
+
